@@ -1,0 +1,29 @@
+{
+  "schema_version": "0.1-draft",
+  "synthetic": true,
+  "id": "demo-cando-001",
+  "product": "CanDo",
+  "audience": "收藏课程后难以持续自学的人",
+  "research_question": "中断后重新整理计划是否是一项值得解决的困难？",
+  "objective": "验证真实需求讨论和内容制作效率",
+  "keywords": [
+    "收藏夹吃灰",
+    "学习计划中断",
+    "课程学习进度"
+  ],
+  "facts": [
+    {
+      "id": "fact-001",
+      "claim": "未完成事项可延续到次日",
+      "status": "unverified",
+      "evidence_ids": []
+    }
+  ],
+  "assets": [],
+  "forbidden_claims": [
+    "效率提升十倍",
+    "已经帮助几千人",
+    "所有教程自动导入"
+  ],
+  "notes": "仅为格式和开发示例，不是已验证的 CanDo 功能或真实用户研究。"
+}

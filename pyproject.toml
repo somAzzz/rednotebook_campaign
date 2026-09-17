@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rednotebook"
+version = "0.6.0"
+description = "Local multimodal evidence research, reviewed creative delivery and outcomes"
+requires-python = ">=3.12"
+dependencies = [
+    "av>=14,<17",
+    "httpx>=0.28,<1",
+    "mcp>=1.20,<2",
+    "openai>=2,<3",
+    "pillow>=11,<13",
+    "playwright>=1.60,<2",
+    "pydantic>=2.11,<3",
+    "pydantic-ai-slim[openai]>=1,<2",
+]
+
+[project.scripts]
+rednotebook = "rednotebook.cli:main"
+rednotebook-browser = "rednotebook.browser_cli:main"
+rednotebook-mcp = "rednotebook.mcp_server:main"
+
+[project.optional-dependencies]
+asr = [
+    "faster-whisper>=1.2,<2",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rednotebook"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<10",
+    "ruff>=0.11,<1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

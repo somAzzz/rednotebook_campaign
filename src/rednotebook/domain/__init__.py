@@ -1,0 +1,1 @@
+"""Validated input contracts."""
