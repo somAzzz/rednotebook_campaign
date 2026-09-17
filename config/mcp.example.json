@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "rednotebook": {
+      "command": "uv",
+      "args": [
+        "--directory", "/absolute/path/to/rednotebook",
+        "run", "--no-sync", "rednotebook-mcp",
+        "--db", "private/browser-research.sqlite",
+        "--profile", "private/browser-profile",
+        "--config", "private/model.toml"
+      ]
+    }
+  }
+}
