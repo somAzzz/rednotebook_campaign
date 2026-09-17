@@ -105,6 +105,9 @@ uv run rednotebook --db <数据库> export <bundle_id> --version 4
 
 完整步骤、工具顺序和限制见 [Playwright/MCP计划与使用](docs/11-browser-mcp-plan.md)，客户端配置见 [MCP配置示例](config/mcp.example.json)。真实搜索已返回候选；最近详情打开成功，但整篇多图采集未完成，分页错误后持久暂停。登录保持已验证；后续分页修复尚未重跑线上采集。异常后恢复需明确操作者命令，不能自动重试。与此前手动浏览器小样本测试分别记录。离线测试中的浏览器DOM用例需要已安装Chromium，不访问外网。
 
+Codex 调用约束随仓库提供在 [RedNotebook Research Skill](skills/rednotebook-research/SKILL.md)；
+MCP 服务自身也携带等价的跨客户端工具说明，不依赖调用模型安装该 Skill 才能识别链接和证据边界。
+
 ## 复盘与只读接入
 
 ```bash
