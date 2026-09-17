@@ -41,11 +41,42 @@ def load_bundle(db, bundle_id, version):
         raise DomainError("bundle_not_found")
     if row["state"] == "revoked" or row["payload"] is None:
         raise DomainError("bundle_revoked")
-    read_run(db, row["run_id"])
+    for source in bundle_sources(db, bundle_id, version):
+        db.require_source(source)
+    for run in bundle_runs(db, bundle_id, version):
+        read_run(db, run)
     payload = json.loads(row["payload"])
     if digest(payload) != row["content_hash"]:
         raise DomainError("bundle_hash_mismatch")
     return dict(row) | {"payload": payload}
+
+
+def bundle_sources(db, bundle_id, version):
+    return [
+        r[0]
+        for r in db.conn.execute(
+            "SELECT source_id FROM bundle_sources WHERE bundle_id=? AND version=?",
+            (bundle_id, version),
+        )
+    ]
+
+
+def bundle_runs(db, bundle_id, version):
+    return [
+        r[0]
+        for r in db.conn.execute(
+            "SELECT run_id FROM bundle_runs WHERE bundle_id=? AND version=?",
+            (bundle_id, version),
+        )
+    ]
+
+
+def parse_editorial(payload, value):
+    if payload.get("kind") == "campaign":
+        from rednotebook.campaign_contracts import PostDraft
+
+        return PostDraft.model_validate(value)
+    return Editorial.model_validate(value)
 
 
 def propose(db, run_id):
@@ -100,8 +131,30 @@ def propose(db, run_id):
     return save_bundle(db, str(uuid4()), run_id, payload)
 
 
-def save_bundle(db, bundle_id, run_id, payload):
-    read_run(db, run_id)
+def save_bundle(db, bundle_id, run_id, payload, *, source_ids=(), run_ids=()):
+    if db.conn.execute(
+        "SELECT 1 FROM bundles WHERE id=? AND state='revoked'", (bundle_id,)
+    ).fetchone():
+        raise DomainError("bundle_revoked")
+    runs = set(run_ids) | ({run_id} if run_id else set())
+    sources = set(source_ids)
+    # Dependencies are monotonic across a lineage: editing prose cannot launder sources.
+    for old in db.conn.execute("SELECT version FROM bundles WHERE id=?", (bundle_id,)):
+        sources.update(bundle_sources(db, bundle_id, old[0]))
+        runs.update(bundle_runs(db, bundle_id, old[0]))
+    for run in runs:
+        read_run(db, run)
+        sources.update(
+            r[0]
+            for r in db.conn.execute(
+                "SELECT source_id FROM research_sources WHERE run_id=?", (run,)
+            )
+        )
+    for source in sources:
+        db.require_source(source, "storage")
+        db.require_source(source)
+    if run_id is None and payload.get("kind") != "campaign":
+        raise DomainError("bundle_context_required")
     hashed = digest(payload)
     with db.conn:
         previous = db.conn.execute(
@@ -127,6 +180,12 @@ def save_bundle(db, bundle_id, run_id, payload):
                 stamp(db.clock()),
             ),
         )
+        db.conn.executemany(
+            "INSERT INTO bundle_sources VALUES (?,?,?)", [(bundle_id, version, s) for s in sources]
+        )
+        db.conn.executemany(
+            "INSERT INTO bundle_runs VALUES (?,?,?)", [(bundle_id, version, r) for r in runs]
+        )
     return load_bundle(db, bundle_id, version)
 
 
@@ -135,7 +194,13 @@ def revise(db, bundle_id, version, editorial):
     payload = row["payload"]
     if any(p.asset_id and p.asset_id not in payload.get("assets", {}) for p in editorial.pages):
         raise DomainError("page_asset_not_found")
+    editorial = parse_editorial(payload, editorial.model_dump())
     payload["editorial"] = editorial.model_dump()
+    if payload.get("kind") == "campaign":
+        from rednotebook.campaign import invalidate_confirmation, validate_output
+
+        invalidate_confirmation(payload)
+        validate_output(payload)
     text = editorial.body + "".join(p.body for p in editorial.pages)
     payload["similarity"] = [
         {"evidence_id": c.get("evidence_id"), "ratio": round(ratio, 3), "review_required": True}
@@ -149,6 +214,10 @@ def review(db, bundle_id, version, expected_hash, reviewer):
     row = load_bundle(db, bundle_id, version)
     if expected_hash != row["content_hash"] or not reviewer.strip():
         raise DomainError("review_hash_or_reviewer_invalid")
+    if row["payload"].get("kind") == "campaign":
+        from rednotebook.campaign import require_ready
+
+        require_ready(db, row)
     with db.conn:
         db.conn.execute(
             "UPDATE bundles SET state='approved',reviewer=?,approved_hash=? "
@@ -183,7 +252,7 @@ def wrap(draw, text, font, width):
     return lines
 
 
-def render_page(page, target, index, preview, assets=None):
+def render_page(page, target, index, preview, assets=None, campaign=False):
     im = Image.new("RGB", (1080, 1620), "#f6f3eb")
     draw = ImageDraw.Draw(im)
     font = font_path()
@@ -221,7 +290,7 @@ def render_page(page, target, index, preview, assets=None):
             original = original.convert("RGB")
             original.thumbnail((920, 500))
             im.paste(original, ((1080 - original.width) // 2, 930))
-    footer = "预览 · 未批准" if preview else "研究观察 · 非普遍结论"
+    footer = "预览 · 未批准" if preview else ("" if campaign else "研究观察 · 非普遍结论")
     draw.text((80, 1490), footer, font=ImageFont.truetype(font, 32), fill="#9c4434")
     im.save(target, format="PNG")
 
@@ -230,10 +299,12 @@ def export(db, bundle_id, version, preview=False):
     row = load_bundle(db, bundle_id, version)
     if not preview and (row["state"] != "approved" or row["approved_hash"] != row["content_hash"]):
         raise DomainError("exact_version_approval_required")
-    for s in db.conn.execute(
-        "SELECT source_id FROM research_sources WHERE run_id=?", (row["run_id"],)
-    ):
-        db.require_source(s[0], "excerpt_export")
+    if not preview and row["payload"].get("kind") == "campaign":
+        from rednotebook.campaign import require_ready
+
+        require_ready(db, row)
+    for source in bundle_sources(db, bundle_id, version):
+        db.require_source(source, "excerpt_export")
     root = db.path.resolve().parent / "managed-exports"
     if root.is_symlink():
         raise DomainError("managed_export_path_invalid")
@@ -265,10 +336,19 @@ def export(db, bundle_id, version, preview=False):
         return {"path": str(target), "manifest": manifest, "reused": True}
     temp = Path(tempfile.mkdtemp(prefix=".render-", dir=root))
     try:
-        editorial = Editorial.model_validate(row["payload"]["editorial"])
+        editorial = parse_editorial(row["payload"], row["payload"]["editorial"])
         for i, page in enumerate(editorial.pages, 1):
-            render_page(page, temp / f"{i:02}.png", i, preview, row["payload"].get("assets"))
+            render_page(
+                page,
+                temp / f"{i:02}.png",
+                i,
+                preview,
+                row["payload"].get("assets"),
+                row["payload"].get("kind") == "campaign",
+            )
         (temp / "body.txt").write_text(editorial.body + "\n\n" + editorial.disclosure)
+        if row["payload"].get("kind") == "campaign":
+            (temp / "title.txt").write_text(editorial.title)
         references = []
         seen_references = set()
         for citation in row["payload"]["citations"]:
@@ -297,6 +377,7 @@ def export(db, bundle_id, version, preview=False):
             "preview": preview,
             "synthetic": row["payload"]["synthetic"],
             "dimensions": [1080, 1620],
+            "page_count": len(editorial.pages),
             "renderer": "Pillow",
             "files": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in temp.iterdir()},
         }
@@ -319,33 +400,36 @@ def export(db, bundle_id, version, preview=False):
             shutil.rmtree(temp)
 
 
+def purge_bundle(db, bundle_id, version):
+    root = db.path.resolve().parent / "managed-exports"
+    for item in db.conn.execute(
+        "SELECT path FROM managed_exports WHERE bundle_id=? AND version=?", (bundle_id, version)
+    ):
+        path = Path(item[0])
+        if path.parent.resolve() != root or path.is_symlink():
+            raise DomainError("managed_export_path_invalid")
+        if path.exists():
+            shutil.rmtree(path)
+    with db.conn:
+        db.conn.execute(
+            "DELETE FROM managed_exports WHERE bundle_id=? AND version=?", (bundle_id, version)
+        )
+        db.conn.execute(
+            "UPDATE bundles SET state='revoked',payload=NULL,reviewer=NULL,approved_hash=NULL "
+            "WHERE id=? AND version=?",
+            (bundle_id, version),
+        )
+        db.conn.execute(
+            "DELETE FROM outcomes WHERE bundle_id=? AND bundle_version=?", (bundle_id, version)
+        )
+
+
 def purge_source(db, source_id):
     rows = db.conn.execute(
-        "SELECT id,version FROM bundles WHERE run_id IN "
-        "(SELECT run_id FROM research_sources WHERE source_id=?)",
-        (source_id,),
+        "SELECT bundle_id,version FROM bundle_sources WHERE source_id=?", (source_id,)
     ).fetchall()
-    root = db.path.resolve().parent / "managed-exports"
     for row in rows:
-        for item in db.conn.execute(
-            "SELECT path FROM managed_exports WHERE bundle_id=? AND version=?", tuple(row)
-        ):
-            path = Path(item[0])
-            if path.parent.resolve() != root or path.is_symlink():
-                raise DomainError("managed_export_path_invalid")
-            if path.exists():
-                shutil.rmtree(path)
-        with db.conn:
-            db.conn.execute(
-                "DELETE FROM managed_exports WHERE bundle_id=? AND version=?", tuple(row)
-            )
-            db.conn.execute(
-                "UPDATE bundles SET state='revoked',payload=NULL WHERE id=? AND version=?",
-                tuple(row),
-            )
-            db.conn.execute(
-                "DELETE FROM outcomes WHERE bundle_id=? AND bundle_version=?", tuple(row)
-            )
+        purge_bundle(db, *tuple(row))
     with db.conn:
         db.conn.execute("DELETE FROM outcomes WHERE source_id=?", (source_id,))
         db.conn.execute("DELETE FROM media_cache WHERE source_id=?", (source_id,))
@@ -365,8 +449,12 @@ def add_asset(db, bundle_id, version, path, owner, rights_ref):
     hashed = hashlib.sha256(raw).hexdigest()
     payload = row["payload"]
     assets = payload.setdefault("assets", {})
-    if len(assets) >= 6 and hashed not in assets:
+    if len(assets) >= (20 if payload.get("kind") == "campaign" else 6) and hashed not in assets:
         raise DomainError("asset_budget_exceeded")
+    if payload.get("kind") == "campaign":
+        from rednotebook.campaign import invalidate_confirmation
+
+        invalidate_confirmation(payload)
     assets[hashed] = {
         "sha256": hashed,
         "owner": owner,

@@ -1,0 +1,45 @@
+{
+  "id": "synthetic-campaign",
+  "synthetic": true,
+  "creator_goal": "合成示例：以高价设备为切入点介绍多个项目，后续分别展开",
+  "audience": "对本地AI用途感兴趣的人",
+  "content_role": "series_opener",
+  "reader_takeaway": "了解各项目的用途和不同进度",
+  "statements": [
+    {
+      "id": "price",
+      "text": "合成设定：设备标示价格17000欧，未确认购买经历或成交价格"
+    }
+  ],
+  "hardware": [
+    {
+      "id": "gpu",
+      "description": "合成设备",
+      "possession": "unknown"
+    }
+  ],
+  "projects": [
+    {
+      "id": "a",
+      "name": "合成项目甲",
+      "purpose": "整理个人资料",
+      "status": "planned"
+    },
+    {
+      "id": "b",
+      "name": "合成项目乙",
+      "purpose": "辅助制作图片",
+      "status": "in_progress"
+    }
+  ],
+  "forbidden_claims": [
+    "不得编造已经购买、项目完成或性能结果"
+  ],
+  "series": {
+    "id": "synthetic-series",
+    "candidate_topics": [
+      "分别展开甲、乙的用途"
+    ],
+    "promises": []
+  }
+}

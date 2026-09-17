@@ -1,3 +1,5 @@
+> v0.7.0 新增创作契约：`rednotebook schema content-brief`、`rednotebook schema campaign-output`。ContentBrief与下述ResearchBrief独立；作者陈述、硬件状态、项目状态和测试结果分别保存，互动和复盘为可选项。SQLite v8迁移不改旧payload/hash/批准，详见[实施与保留策略](15-campaign-implementation.md)。
+
 # v0.2 数据契约与操作语义
 
 契约唯一代码来源为 `src/rednotebook/domain/models.py`；可用 `rednotebook schema brief|grant|evidence` 输出 JSON Schema。当前 schema_version 属于初版契约；未知字段拒绝，字段名不会默默忽略。

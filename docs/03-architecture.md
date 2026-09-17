@@ -1,3 +1,5 @@
+> 当前增量：v0.7.0 增加独立 ContentBrief / campaign 服务，复用 bundle、精确版本审核与渲染。SQLite v8 使用 bundle_sources / bundle_runs 记录每版本依赖；研究摘要兼容六页，新发布稿1–20页。迁移与保留策略见[策划实施说明](15-campaign-implementation.md)。下文保留原始研究架构。
+
 # 技术设计（目标态）
 
 当前 v0.3.0 已实现 S1 契约、S2/S3 本地核心及 S4 研究工程。本文仍包含后续目标设计；实际边界见 [数据契约](08-data-contract.md) 和 [当前进度](07-status.md)。

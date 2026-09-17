@@ -10,6 +10,15 @@ from rednotebook.errors import DomainError
 from rednotebook.util import canonical, digest
 
 
+class ReaderFeedback(Contract):
+    id: Identifier
+    category: Literal["resource_request", "specific_question", "topic_preference", "other"]
+    text: Text = Field(max_length=3000)
+    source_ref: Text = Field(max_length=2000)
+    classification_definition: Text = Field(max_length=1000)
+    classified_by: Text = Field(max_length=200)
+
+
 class Outcome(Contract):
     bundle_id: Text
     bundle_version: int = Field(ge=1, strict=True)
@@ -19,7 +28,9 @@ class Outcome(Contract):
     published_at: Timestamp
     observed_at: Timestamp
     window: Literal["24h", "72h", "7d"]
-    metrics: list[Metric] = Field(min_length=1)
+    metrics: list[Metric] = Field(default_factory=list)
+    reader_feedback: list[ReaderFeedback] = Field(default_factory=list, max_length=100)
+    author_notes: str = Field(default="", max_length=3000)
     production_minutes: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     baseline_minutes: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     quality_rating: int | None = Field(default=None, ge=1, le=5, strict=True)
@@ -28,6 +39,16 @@ class Outcome(Contract):
     def valid(self):
         if self.observed_at < self.published_at:
             raise ValueError("observation_before_publication")
+        if len({f.id for f in self.reader_feedback}) != len(self.reader_feedback):
+            raise ValueError("duplicate_feedback")
+        if (
+            not self.metrics
+            and not self.reader_feedback
+            and not self.author_notes.strip()
+            and self.production_minutes is None
+            and self.quality_rating is None
+        ):
+            raise ValueError("outcome_observation_required")
         if len({m.name for m in self.metrics}) != len(self.metrics):
             raise ValueError("duplicate_metric")
         for m in self.metrics:
@@ -44,7 +65,7 @@ def import_outcome(db, outcome):
     payload = outcome.model_dump(mode="json")
     key = digest([outcome.source_id, outcome.note_url, payload["observed_at"], outcome.window])
     existing = db.conn.execute("SELECT payload FROM outcomes WHERE id=?", (key,)).fetchone()
-    if existing and existing[0] != canonical(payload):
+    if existing and Outcome.model_validate_json(existing[0]).model_dump(mode="json") != payload:
         raise DomainError("outcome_snapshot_conflict")
     with db.conn:
         db.conn.execute(
@@ -55,7 +76,8 @@ def import_outcome(db, outcome):
 
 
 def retrospective(db, bundle_id, version):
-    load_bundle(db, bundle_id, version)
+    bundle = load_bundle(db, bundle_id, version)
+    brief = bundle["payload"].get("context", {}).get("brief", {})
     items = []
     for row in db.conn.execute(
         "SELECT * FROM outcomes WHERE bundle_id=? AND bundle_version=?", (bundle_id, version)
@@ -80,6 +102,9 @@ def retrospective(db, bundle_id, version):
         "bundle_id": bundle_id,
         "version": version,
         "observations": items,
+        "measurement_plan": brief.get("measurement"),
+        "series_context": brief.get("series"),
+        "feedback_interpretation": "manual_classification_not_demand_strength_or_causal_attribution",
         "missing_windows": sorted(
             {"24h", "72h", "7d"} - {i["window"] for i in items if i["within_window"]}
         ),

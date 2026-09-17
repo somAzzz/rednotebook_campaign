@@ -18,6 +18,8 @@ from rednotebook.storage.migrations import (
     MIGRATION_5,
     MIGRATION_6,
     MIGRATION_7,
+    MIGRATION_8,
+    MIGRATION_9,
 )
 from rednotebook.util import canonical, digest, now_utc, stamp
 
@@ -115,7 +117,25 @@ class Database:
         if version == 6:
             self.conn.executescript(MIGRATION_7)
             version = 7
-        if version != 7:
+        if version == 7:
+            self.conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                self.conn.executescript(MIGRATION_8)
+                if self.conn.execute("PRAGMA foreign_key_check").fetchone():
+                    raise DomainError("migration_foreign_key_check_failed")
+                self.conn.commit()
+                version = 8
+            except BaseException:
+                self.conn.rollback()
+                self.conn.close()
+                raise
+            finally:
+                if version == 8:
+                    self.conn.execute("PRAGMA foreign_keys=ON")
+        if version == 8:
+            self.conn.executescript(MIGRATION_9)
+            version = 9
+        if version != 9:
             self.conn.close()
             raise DomainError("unsupported_database_version")
         self.salt = self.conn.execute(
