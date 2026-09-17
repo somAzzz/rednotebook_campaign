@@ -1,0 +1,7 @@
+# Copy to private/model.toml (Git ignored); use your own local endpoint and key.
+base_url = "http://127.0.0.1:30000/v1"
+model = "your-local-model"
+api_key = "replace-with-local-service-key"
+timeout_seconds = 180
+max_tokens_per_call = 8192
+enable_thinking = false
