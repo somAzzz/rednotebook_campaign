@@ -1,0 +1,69 @@
+{
+  "version": "0.5.1",
+  "date": "2026-09-17",
+  "schema_version": 6,
+  "offline_test_count": 112,
+  "browser_test_cases": 24,
+  "mcp_transport": "stdio",
+  "mcp_protocol_initialize_list_call": "passed",
+  "playwright_offline_dom": "passed",
+  "real_browser_open": "passed",
+  "real_browser_observed_state": "user_reported_restriction_then_manual_access_restored",
+  "real_search_and_collection": "search_5_candidates_detail_collection_failed_stopped",
+  "model_pipeline": "reused_v0.4_not_retested_on_new_captures",
+  "video_asr": "deferred_by_user",
+  "client_registration": "configuration_example_only",
+  "limitations": [
+    "DOM_selectors_require_live_validation",
+    "unknown_search_ranking",
+    "bounded_visible_comments",
+    "single_source_MCP_research",
+    "generated_creative_available_via_existing_CLI"
+  ],
+  "automation_state": "paused_after_hidden_pagination_failure",
+  "pacing": {
+    "navigation_interval_seconds": 60,
+    "action_interval_seconds": 3,
+    "hourly_page_budget": 10,
+    "platform_safe_rate_claim": false
+  },
+  "latest_single_note_attempt": {
+    "search_job_id": "308572b9-4250-4cc8-852b-11e82560b017",
+    "search_state": "paused",
+    "error_code": "login_required",
+    "candidate_count": 0,
+    "notes_opened": 0,
+    "automatic_retries": 0
+  },
+  "session_persistence": {
+    "real_login_before_restart": "visible_account_navigation",
+    "after_browser_restart": "logged_in",
+    "after_controller_reconnect": "logged_in",
+    "independent_mcp_process_checks": [
+      "logged_in",
+      "logged_in"
+    ],
+    "browser_kept_running": true,
+    "control_listener": "127.0.0.1",
+    "cookies_exported": false,
+    "searches_during_session_verification": 0,
+    "collections_during_session_verification": 0
+  },
+  "mcp_research_test": {
+    "fresh_search": "passed_one_candidate",
+    "fresh_detail_navigation": "passed",
+    "fresh_full_capture": "failed_hidden_pagination_locator",
+    "locator_fix": "offline_pass_and_read_only_8_visible_controls_no_click_retest",
+    "research_input": "previously_saved_real_notes",
+    "notes": 3,
+    "comments": 30,
+    "findings": 3,
+    "local_model_calls": 3,
+    "job_resource": "passed",
+    "draft_revision": 2,
+    "preview_pages": 6,
+    "unapproved_export": "correctly_rejected",
+    "semantic_quality_verified": false,
+    "research_run_id": "41643961-5f31-46dc-9c81-cd6ffa55406b"
+  }
+}

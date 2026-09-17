@@ -1,0 +1,75 @@
+{
+  "at": "2026-09-17T13:42:09.603121+00:00",
+  "probe": {
+    "model": "qwen3.8-27b",
+    "connectivity": true,
+    "structured_output": true,
+    "tool_calling": true,
+    "visual_analysis": "not_tested",
+    "model_listed": true,
+    "usage": {
+      "calls": 2,
+      "input_reserved": 6317,
+      "output_reserved": 4096,
+      "reported_input": 941,
+      "reported_output": 79,
+      "reservation_method": "UTF-8 serialized message bytes + 1024 overhead; output cap per attempt",
+      "reported_usage_is_provider_supplied": true
+    }
+  },
+  "synthetic_only": true,
+  "real_semantic_acceptance": false,
+  "research": {
+    "state": "complete",
+    "selected_notes": 3,
+    "selected_comments": 6,
+    "completed_batches": 1,
+    "errors": [],
+    "usage": {
+      "calls": 2,
+      "input_reserved": 34408,
+      "output_reserved": 4096,
+      "reported_input": 9794,
+      "reported_output": 526,
+      "reservation_method": "UTF-8 serialized message bytes + 1024 overhead; output cap per attempt",
+      "reported_usage_is_provider_supplied": true
+    },
+    "tool_calls": [
+      "compare_metrics"
+    ],
+    "findings": 3,
+    "matched_citations": 9
+  },
+  "project_version": "0.3.0",
+  "offline_tests_passed": 71,
+  "lock_sha256": "eede99b44c0bf7a0427fad7a4e4fa6b69982bba35504bb69abafead1022d7ca8",
+  "source_hashes": {
+    "src/rednotebook/__init__.py": "8e3c7e625f14b2ec019e8730522d746af56ce460f6db04672b629c56883a0e5c",
+    "src/rednotebook/__main__.py": "5dc2ae0f26bbda792af883463742f5393ad4fc9a703c46b0a01c60220fadbb01",
+    "src/rednotebook/adapters/__init__.py": "fb192109295d4ecb45ad1d23f695dc098f5544d0b6ee9826bfd58841fa407e96",
+    "src/rednotebook/adapters/files.py": "24df26a4535309ec8856f7a0821c611327ae3ae63f021f2b9261710f982bf07e",
+    "src/rednotebook/analysis/__init__.py": "41e5370c5afd205b56bd4cfeccf0460db6b659666717386de182766dc2e244f4",
+    "src/rednotebook/analysis/metrics.py": "5859086d42d08bd639f638bebaf605745644ceac294a639933a8055db230b11f",
+    "src/rednotebook/analysis/quality.py": "fa5ffff994c478e582a636e72b0455a07e0c170a8bbbac2f80a8a1fd5e99d7ed",
+    "src/rednotebook/cli.py": "53cb977c8eb225cf029bac881a5e78a8629797c626861deb33ba95ac8666fae5",
+    "src/rednotebook/domain/__init__.py": "d2e5ce304becfbea298c582964bb1cdb7738f5decd07a3049c40e288aecee36f",
+    "src/rednotebook/domain/models.py": "0ceea41fdcfd2ae61ba823f4645ea91b7f3241ae5db8255e115944ad5610eb68",
+    "src/rednotebook/errors.py": "39151fc786c7395392a2cd7d1ecdf0f007529e904534bdfe8c1ca82671199aee",
+    "src/rednotebook/fixtures.py": "53904c685cc9036d1ce48a595bb593ec7346a3e3a1e395a414a3811d6ab3a314",
+    "src/rednotebook/importing.py": "333baf787563a2076e51b362174d41ddcf7431e549cf9786c9a3e84e3ec1424c",
+    "src/rednotebook/research/__init__.py": "5e44ce2c9737e77bd62b619bb0096ceb4549d07ba0b71b7b66c430fb2b0d6be8",
+    "src/rednotebook/research/config.py": "fd1cc416de1c845a48d9f9d3aeaed1b02a71fa4f1a2284d6105bb852d4406b1d",
+    "src/rednotebook/research/contracts.py": "30c633dd30e5b9369cba6269d451350c9f1804ac5c0313246c56e71c309e09bb",
+    "src/rednotebook/research/fixtures.py": "96f45d18279feccddb8edc778358e8d9bcc10f588e5388e6a5ad0dbea2071ab7",
+    "src/rednotebook/research/gateway.py": "141301848566cc3c226486cf599d51832c22debc3a1b2d977803012adef6f7ad",
+    "src/rednotebook/research/model.py": "ddcacb04e585ff7408188780cb99d411fdece7852ef648f1f0b23e2169dde98e",
+    "src/rednotebook/research/probe.py": "9e27860bedfb2b88c13d4a79872971acd293e8ff1f4692a462292813948101b2",
+    "src/rednotebook/research/render.py": "3e0003dc9b44099e4b1ebdbe6d6997822ef3862fd3ae2750e18b9d36e21e1589",
+    "src/rednotebook/research/runner.py": "cdcea901b8bec6122b5bde6334c57e5758a0dcd3b9dae940cb08a0df58be0b0f",
+    "src/rednotebook/research/store.py": "3d8498274915d8b503e4e264453d4aeefa2cd2a69d238449b3542219d9ccc727",
+    "src/rednotebook/storage/__init__.py": "5fd563b6fa0e05178a4ee49b5558efa4e59ec6618cbee7af5a9d16c116c223e2",
+    "src/rednotebook/storage/database.py": "b8e74e923a8992ae7d1973b63eb55180e4966a7cf74fa5193cc1edfe757f6099",
+    "src/rednotebook/storage/migrations.py": "00fc053399c130009d7723bb4e20d1729ce8e6fd05127fa1287a5d95d4ae22d4",
+    "src/rednotebook/util.py": "ac600918b440e2eda8d7769f6629431f6452cd3e6919b7afdbfd9d7ab7c6c424"
+  }
+}

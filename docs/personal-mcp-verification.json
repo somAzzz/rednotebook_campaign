@@ -1,0 +1,25 @@
+{
+  "version": "0.6.0",
+  "date": "2026-09-17",
+  "schema_version": 7,
+  "pytest": {
+    "passed": 125,
+    "scope": "offline temporary databases and explicitly synthetic fixtures"
+  },
+  "uv_sync_locked": "pass",
+  "ruff_check": "pass",
+  "ruff_format_check": "pass",
+  "check_scaffold": "pass",
+  "verify_foundation": "pass",
+  "code_sha256": "3f183db406d737dd3dded427fe8d58a77bdac8be6bd73da2e54f98dd2e4bff9b",
+  "lock_sha256": "6a35ab8b7043f0968b3a0540587ea8b7aec5a5efb11e4ab9801c4577d0076f27",
+  "real_browser_resumed": false,
+  "new_real_capture_validated": false,
+  "semantic_accuracy_validated": false,
+  "limitations": [
+    "Real whole-gallery acquisition still requires separate explicit browser resumption and validation.",
+    "User feedback is not independent semantic verification or export approval.",
+    "Imported observations remain immutable; enrich before first import.",
+    "No automatic browser retries or cross-page gap recovery."
+  ]
+}

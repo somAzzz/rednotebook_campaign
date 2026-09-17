@@ -1,0 +1,38 @@
+{
+  "date": "2026-09-17",
+  "version": "0.4.0",
+  "schema_version": 5,
+  "offline_tests_passed": 88,
+  "ruff_check": "passed",
+  "ruff_format_check": "passed",
+  "foundation_check": "passed",
+  "public_pilot": {
+    "notes": 3,
+    "comments": 30,
+    "platform_formats": [
+      "image_text"
+    ],
+    "text_channel_tested": true,
+    "native_text_note_real_validation": false,
+    "gallery_images": 8,
+    "gallery_processed": 8,
+    "repeat_requests": 0,
+    "all_repeat_images_cached": true,
+    "research_run_id": "425d801a-c884-4544-b296-4f7b9813e5ac",
+    "preview_pages": 6,
+    "preview_dimensions": [
+      1080,
+      1620
+    ],
+    "preview_state": "draft"
+  },
+  "deferred_by_user": [
+    "video",
+    "asr"
+  ],
+  "not_accepted": [
+    "held_out_semantic_quality_benchmark",
+    "longitudinal_owner_value_pilot",
+    "stable_full_online_adapter"
+  ]
+}

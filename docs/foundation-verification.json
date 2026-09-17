@@ -1,0 +1,21 @@
+{
+  "result": "pass",
+  "scope": "S1-S3 synthetic engineering only",
+  "at": "2026-09-16T22:04:48.236173+00:00",
+  "platform": "macOS-26.6.2-arm64-arm-64bit",
+  "python": "3.12.13",
+  "code_sha256": "e6b71830f7457c9626af2ef994a99c8e8479dc5612effa099732c785ea015012",
+  "lock_sha256": "1cf81a55d5cdcd7981525683860ca9f0a5b961ff0940f14b99badc5341cbcdc2",
+  "fixture_sha256": "788f991fefb4f0a95fb8d0dec2511a1a27d4ce26a200b3a45cf0756802149de4",
+  "elapsed_seconds": 0.181,
+  "peak_rss_mb": 46.2,
+  "unique_notes": 200,
+  "unique_comments": 500,
+  "metric_snapshots": 603,
+  "valid_input_rows": 702,
+  "rejected_rows": 3,
+  "scored_notes": 197,
+  "repeat_import_added_records": 0,
+  "revocation_purged_records": 700,
+  "real_data_research_validated": false
+}
