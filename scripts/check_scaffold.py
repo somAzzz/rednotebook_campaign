@@ -6,13 +6,14 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def cli(command):
+def cli(command, db_path):
     completed = subprocess.run(
-        [sys.executable, "-m", "rednotebook", command],
+        [sys.executable, "-m", "rednotebook", "--db", str(db_path), command],
         check=True,
         capture_output=True,
         text=True,
@@ -21,9 +22,11 @@ def cli(command):
 
 
 def main():
-    doctor = cli("doctor")
+    with TemporaryDirectory(prefix="rednotebook-scaffold-") as temporary:
+        db_path = Path(temporary) / "test.sqlite"
+        doctor = cli("doctor", db_path)
+        status = cli("status", db_path)
     assert doctor["python_ok"] and doctor["sqlite_ok"], doctor
-    status = cli("status")
     assert status["stage"] == "S8-playwright-mcp"
     assert {"status", "doctor", "import", "quality", "metrics rank"} <= set(status["implemented"])
     assert "analyse" in status["implemented"]

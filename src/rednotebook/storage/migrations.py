@@ -84,3 +84,51 @@ CREATE INDEX finding_reviews_run ON finding_reviews(run_id,finding_id,created_at
 PRAGMA user_version=7;
 COMMIT;
 """
+
+
+# Rebuild only the parent table with FK enforcement temporarily disabled by the caller.
+# Existing payload bytes, hashes, approvals, exports and outcome FK targets are unchanged.
+# New per-version dependencies also cover author-led drafts that include research context.
+MIGRATION_8 = """
+BEGIN IMMEDIATE;
+CREATE TABLE bundles_v8(
+ id TEXT NOT NULL, version INTEGER NOT NULL, run_id TEXT REFERENCES research_runs(id),
+ content_hash TEXT NOT NULL, payload TEXT, state TEXT NOT NULL,
+ reviewer TEXT, approved_hash TEXT, created_at TEXT NOT NULL,
+ PRIMARY KEY(id,version)
+);
+INSERT INTO bundles_v8 SELECT * FROM bundles;
+DROP TABLE bundles;
+ALTER TABLE bundles_v8 RENAME TO bundles;
+CREATE TABLE bundle_sources(
+ bundle_id TEXT NOT NULL, version INTEGER NOT NULL,
+ source_id TEXT NOT NULL REFERENCES sources(id),
+ PRIMARY KEY(bundle_id,version,source_id),
+ FOREIGN KEY(bundle_id,version) REFERENCES bundles(id,version)
+);
+INSERT INTO bundle_sources
+ SELECT b.id,b.version,s.source_id FROM bundles b
+ JOIN research_sources s ON s.run_id=b.run_id;
+CREATE TABLE bundle_runs(
+ bundle_id TEXT NOT NULL, version INTEGER NOT NULL,
+ run_id TEXT NOT NULL REFERENCES research_runs(id),
+ PRIMARY KEY(bundle_id,version,run_id),
+ FOREIGN KEY(bundle_id,version) REFERENCES bundles(id,version)
+);
+INSERT INTO bundle_runs SELECT id,version,run_id FROM bundles WHERE run_id IS NOT NULL;
+CREATE TABLE diagnostic_events(
+ id TEXT PRIMARY KEY, error_stage TEXT NOT NULL, error_code TEXT NOT NULL, created_at TEXT NOT NULL
+);
+PRAGMA user_version=8;
+"""
+
+
+# Forward-only activation of the persisted intent-plan/job JSON contract.
+# Legacy jobs remain byte-identical; new fields have defaults on read. Older binaries
+# must reject v9 instead of attempting to parse unknown plan_search/search_plan jobs.
+MIGRATION_9 = """
+BEGIN IMMEDIATE;
+INSERT OR IGNORE INTO settings VALUES ('search_plan_contract_version','1');
+PRAGMA user_version=9;
+COMMIT;
+"""

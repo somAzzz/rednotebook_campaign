@@ -34,7 +34,7 @@
 
 - `capture_images=false`：只采集文字和限定评论，不点击图片分页，不推断图片总数；`analyse_images=false` 则仅跳过模型图片分析。
 - 正文读取后、评论更新后、每张图片下载后，都原子保存当前证据文件。异常、超时、取消或服务重启后可找回已保存部分；保留缺页和未知总数。
-- 新采集出现 partial 后停止整合流程，不自动将不完整材料送入研究。浏览器异常仍持久暂停。
+- 新采集出现 partial 后停止整合流程，不自动将不完整材料送入研究。详情DOM、搜索DOM或分页等任务局部失败只结束当前任务。总任务超时、契约错误和未知本地异常产生失败暂停；下一次用户明确发起的新检索可在 `access.new_search_reset_available=true` 时复位并保留访问历史。登录、验证码、限流、访问拒绝、意外页面、人工及未知暂停仍须操作者恢复。失败后只检查一次 `browser_status`，不自动重试；`retry_job`、采集和工作流续跑都不会复位。
 - 查看结果后，可使用 `import_capture(capture_id, enriched=false, allow_partial=true)` 显式导入文字；或调用 `research_workflow(capture_id=..., brief=..., source_id=..., allow_partial=true)` 继续本地处理。续跑不需要解除浏览器暂停。
 - 使用结果中的真实 `capture_id`，而非后续分析任务ID。传入的Brief ID必须与采集时一致。
 - 工作流失败重试优先使用已保存的capture，避免重新访问网页。缺页补采仍需操作者明确恢复后的新采集；没有跨网页自动断点续采。

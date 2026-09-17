@@ -19,7 +19,14 @@ from rednotebook.importing import import_file
 from rednotebook.research.config import ResearchBudget, load_config
 from rednotebook.research.gallery import Gallery, analyse_gallery
 from rednotebook.research.runner import analyse
-from rednotebook.util import atomic_json, canonical, stamp
+from rednotebook.search_intent import (
+    SearchIntent,
+    SearchPlan,
+    generate_plan,
+    make_plan,
+    merge_candidates,
+)
+from rednotebook.util import atomic_json, canonical, digest, stamp
 
 PAUSED = {
     "browser_access_paused",
@@ -32,8 +39,14 @@ PAUSED = {
 
 
 class JobRequest(Contract):
-    operation: Literal["search", "collect", "analyse_gallery", "research", "workflow"]
+    operation: Literal[
+        "search", "collect", "analyse_gallery", "research", "workflow", "plan_search", "search_plan"
+    ]
     source_id: Identifier
+    intent: SearchIntent | None = None
+    search_plan: SearchPlan | None = None
+    plan_job_id: str | None = None
+    use_model: bool = False
     keyword: str = Field(default="", max_length=100)
     limit: int = Field(default=10, ge=1, le=20, strict=True)
     scrolls: int = Field(default=3, ge=0, le=5, strict=True)
@@ -51,7 +64,7 @@ class JobRequest(Contract):
 
     @property
     def browser_work(self):
-        return self.operation in {"search", "collect"} or (
+        return self.operation in {"search", "collect", "search_plan"} or (
             self.operation == "workflow" and not self.capture_id
         )
 
@@ -115,9 +128,31 @@ class BrowserService:
             self.db.require_source(source_id, "automated_access")
         return source
 
-    def submit(self, request: JobRequest):
+    def submit(self, request: JobRequest, *, reset_failure_pause=True):
         self.tasks = {key: task for key, task in self.tasks.items() if not task.done()}
-        self.require(request.source_id, request.browser_work)
+        self.require(request.source_id)
+        if request.browser_work:
+            self.db.require_source(request.source_id, "automated_access")
+        if request.operation == "plan_search" and request.intent is None:
+            raise DomainError("search_intent_required")
+        if request.operation == "plan_search":
+            request = request.model_copy(update={"keyword": request.intent.primary_query})
+        if request.operation == "search_plan":
+            if not request.plan_job_id:
+                raise DomainError("search_plan_job_required")
+            parent = self.get(request.plan_job_id, True)
+            if (
+                parent["source_id"] != request.source_id
+                or parent["operation"] != "plan_search"
+                or parent["state"] != "complete"
+            ):
+                raise DomainError("search_plan_job_invalid")
+            plan = SearchPlan.model_validate(parent["result"]["plan"])
+            request = request.model_copy(
+                update={"search_plan": plan, "keyword": plan.intent.primary_query}
+            )
+        if request.browser_work and self.gate.status().get("remaining_hourly_navigations") == 0:
+            raise DomainError("browser_hourly_budget_wait")
         if request.browser_work and any(
             not task.done() and self.is_browser_job(key) for key, task in self.tasks.items()
         ):
@@ -141,6 +176,11 @@ class BrowserService:
                 raise DomainError("workflow_brief_mismatch")
             if request.brief.synthetic != self.require(request.source_id).synthetic:
                 raise DomainError("synthetic_flag_mismatch")
+        reset_reason = None
+        if reset_failure_pause and request.operation in {"search", "search_plan"}:
+            reset_reason = self.gate.reset_for_new_search()
+        if request.browser_work:
+            self.gate.require_active()
         ident = str(uuid4())
         at = stamp(self.db.clock())
         with self.db.conn:
@@ -157,8 +197,16 @@ class BrowserService:
                     at,
                 ),
             )
-        self.tasks[ident] = asyncio.create_task(self._run(ident, request))
-        return {"job_id": ident, "state": "queued"}
+        self.tasks[ident] = asyncio.create_task(
+            self._run(ident, request, reset_browser=bool(reset_reason))
+        )
+        result = {"job_id": ident, "state": "queued"}
+        if reset_reason:
+            result["browser_reset"] = {
+                "reason": reset_reason,
+                "history_preserved": True,
+            }
+        return result
 
     def is_browser_job(self, ident):
         row = self.db.conn.execute(
@@ -222,22 +270,29 @@ class BrowserService:
                 ),
             )
 
-    async def _run(self, ident, request):
+    async def _run(self, ident, request, *, reset_browser=False):
         try:
             async with self.execution_lock(request):
+                if reset_browser:
+                    # Drop stale locators/controller state, but keep the dedicated
+                    # Chromium process, profile, login, and access history.
+                    await self.reader.close()
                 self.require(request.source_id, request.browser_work)
                 self.update(ident, "running")
                 self.progress(ident, request.operation)
                 async with asyncio.timeout(
                     request.model_timeout_seconds
-                    if request.operation in {"analyse_gallery", "research", "workflow"}
-                    else 180
+                    if request.operation
+                    in {"analyse_gallery", "research", "workflow", "plan_search"}
+                    else (
+                        180 * len(request.search_plan.queries)
+                        if request.operation == "search_plan"
+                        else 180
+                    )
                 ):
                     result = await self.execute(ident, request)
                 self.progress(ident, "finished")
                 self.require(request.source_id)
-                if request.operation == "collect" and result.get("errors"):
-                    self.gate.pause("capture_incomplete_requires_review")
                 self.update(
                     ident,
                     "complete"
@@ -252,7 +307,11 @@ class BrowserService:
                 self.gate.pause("browser_job_timeout")
             self.update(ident, "failed", code="job_timeout")
         except DomainError as exc:
-            if self.is_browser_job(ident):
+            if (
+                self.is_browser_job(ident)
+                and exc.code in PAUSED
+                and exc.code != "browser_access_paused"
+            ):
                 self.gate.pause(exc.code)
             self.update(ident, "paused" if exc.code in PAUSED else "failed", code=exc.code)
         except ValidationError:
@@ -270,6 +329,71 @@ class BrowserService:
             return self.require(request.source_id, request.browser_work)
 
         source = check()
+        if request.operation == "plan_search":
+            plan = make_plan(request.intent)
+            # Save a usable deterministic plan before optional model work.
+            result = {
+                "plan": plan.model_dump(mode="json"),
+                "plan_hash": digest(plan.model_dump(mode="json")),
+            }
+            self.update(ident, "running", result)
+            if request.use_model and not plan.intent.exact_only and plan.intent.max_queries > 1:
+                plan = await generate_plan(
+                    request.intent, load_config(self.config), check, budget=request.budget
+                )
+            return {
+                "state": "complete",
+                "plan": plan.model_dump(mode="json"),
+                "plan_hash": digest(plan.model_dump(mode="json")),
+                "source_id": source.id,
+            }
+        if request.operation == "search_plan":
+            plan = request.search_plan
+            results = []
+
+            def snapshot():
+                return {
+                    "state": "partial",
+                    "plan_job_id": request.plan_job_id,
+                    "plan": plan.model_dump(mode="json"),
+                    "plan_hash": digest(plan.model_dump(mode="json")),
+                    "source_id": source.id,
+                    "query_results": results,
+                    "completed_queries": len(results),
+                    "planned_queries": len(plan.queries),
+                    "candidates": merge_candidates(results),
+                    "limitations": [
+                        "bounded_search_not_representative",
+                        "ranking_unverified",
+                        "expansion_not_subject_evidence",
+                        "groups_are_query_origin_only",
+                    ],
+                }
+
+            self.update(ident, "running", snapshot())
+            for query in plan.queries:
+                check()
+                self.progress(
+                    ident,
+                    "search_plan",
+                    query_id=query.id,
+                    completed_queries=len(results),
+                    planned_queries=len(plan.queries),
+                )
+                async with asyncio.timeout(180):
+                    result = await self.reader.search(
+                        query.query, query.limit, plan.intent.scrolls, check
+                    )
+                check()
+                if result.get("state") in {"failed", "paused", "skipped"} or result.get(
+                    "error_code"
+                ):
+                    raise DomainError("planned_query_failed")
+                results.append(
+                    {**result, "query": query.model_dump(), "observed_at": stamp(self.db.clock())}
+                )
+                self.update(ident, "running", snapshot())
+            return snapshot() | {"execution_complete": True}
         if request.operation == "workflow":
             return await self.workflow(ident, request)
         if request.operation == "search":
@@ -411,7 +535,8 @@ class BrowserService:
         saved = self.get(ident, True).get("result") or {}
         if parsed.operation == "workflow" and saved.get("capture_id"):
             parsed = parsed.model_copy(update={"capture_id": saved["capture_id"], "url": ""})
-        return self.submit(parsed)
+        # Retrying the failed attempt is not a fresh user search and may not clear its pause.
+        return self.submit(parsed, reset_failure_pause=False)
 
     def import_capture(self, ident, enriched=True, allow_partial=False):
         if self.model_lock.locked():

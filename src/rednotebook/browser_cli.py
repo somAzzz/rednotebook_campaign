@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from rednotebook.browser_control import AccessGate
 from rednotebook.browser_service import BrowserService, JobRequest
 from rednotebook.errors import DomainError
+from rednotebook.search_intent import SearchIntent
 from rednotebook.storage import Database
 from rednotebook.util import canonical
 
@@ -18,7 +19,7 @@ from rednotebook.util import canonical
 async def run(args, db):
     service = BrowserService(db, args.profile, args.config)
     try:
-        if args.action in {"status", "close"}:
+        if args.action in {"status", "close", "recover-ui"}:
             try:
                 await service.reader.open(attach_only=True)
             except DomainError as exc:
@@ -28,6 +29,16 @@ async def run(args, db):
             if args.action == "close":
                 await service.reader.shutdown()
                 return {"state": "closed"}
+            if args.action == "recover-ui":
+                dismissed = await service.reader.dismiss_note_overlay(paced=False)
+                return {
+                    "state": "complete",
+                    "note_overlay": "dismissed" if dismissed else "not_present",
+                    "access": service.gate.status(),
+                    "next_action": "explicit_operator_resume_required"
+                    if service.gate.status()["paused"]
+                    else None,
+                }
             return await service.reader.state()
         if args.action == "login":
             await service.reader.open()
@@ -61,7 +72,18 @@ async def run(args, db):
             return {"state": "closed", "profile": "dedicated_persistent_profile"}
         if args.action == "job":
             return service.get(args.id, include_result=True)
-        if args.action == "search":
+        if args.action == "plan-search":
+            request = JobRequest(
+                operation="plan_search",
+                source_id=args.source,
+                intent=SearchIntent.model_validate_json(args.file.read_bytes()),
+                use_model=args.generate,
+            )
+        elif args.action == "search-plan":
+            request = JobRequest(
+                operation="search_plan", source_id=args.source, plan_job_id=args.plan_job
+            )
+        elif args.action == "search":
             request = JobRequest(
                 operation="search",
                 source_id=args.source,
@@ -94,6 +116,7 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="action", required=True)
     sub.add_parser("login")
     sub.add_parser("status")
+    sub.add_parser("recover-ui")
     sub.add_parser("close")
     sub.add_parser("pause")
     sub.add_parser("resume")
@@ -103,6 +126,13 @@ def main(argv=None):
     search.add_argument("--keyword", required=True)
     search.add_argument("--limit", type=int, default=10)
     search.add_argument("--scrolls", type=int, default=3)
+    plan = sub.add_parser("plan-search")
+    plan.add_argument("--source", required=True)
+    plan.add_argument("--file", type=Path, required=True)
+    plan.add_argument("--generate", action="store_true")
+    planned = sub.add_parser("search-plan")
+    planned.add_argument("--source", required=True)
+    planned.add_argument("--plan-job", required=True)
     collect = sub.add_parser("collect")
     collect.add_argument("--source", required=True)
     collect.add_argument("--url", required=True)

@@ -92,11 +92,12 @@ P1–P5第一版代码已实现；P6离线与MCP协议验收见后续记录。�
 
 已在本地修正可见签名链接的优先选择，并增加独立于来源的浏览器暂停标记与访问历史：
 
-- 每次页面导航至少间隔60秒，图片翻页/滚动至少间隔3秒；每小时最多10次导航。时间记录跨进程保留。这些只是保守默认值，不能保证平台不限制访问。
+- 每次页面导航至少间隔60秒，图片翻页/滚动至少间隔3秒；按操作者要求每小时最多60次导航。时间记录跨进程保留。额度用完时返回等待状态，不写入持久暂停；这些只是本地预算，不能保证平台不限制访问。
 - 只允许一个未完成的浏览器任务；模型任务的队列仍独立受原预算约束。
-- 401/403/429、验证码、登录失效、详情缺失、采集错误和浏览器超时都停止后续自动访问；只读状态与已完成结果仍可读取。
-- MCP新增 `pause_browser`，没有自动恢复工具。暂停后 `retry_job` 也不能发出浏览器请求；重启服务不会清除暂停。
-- 只有操作者明确恢复时才运行 `uv run rednotebook-browser resume`。此命令保留访问历史，不立即打开页面。`uv run rednotebook-browser pause` 可在服务运行时设置暂停标记。
+- 401/403/429、验证码、登录失效和意外页面停止后续自动访问，且新的检索也不会解除；详情缺失、搜索DOM缺失、分页不可交互等任务局部错误返回failed/partial，不伪装成访问风险。总任务超时、契约错误和未知本地浏览器异常结束当前任务并写入可复位的失败暂停，避免故障任务继续运行。只读状态与已完成结果仍可读取。
+- MCP新增 `pause_browser`，没有通用自动恢复工具。暂停后 `retry_job`、采集与工作流续跑都不能发出浏览器请求；重启服务不会清除暂停。只有 `browser_status.access.new_search_reset_available=true` 时，下一次用户明确发起的 `search_notes` 或 `search_with_plan` 才会清除该失败暂停，断开旧 Playwright 控制上下文、重连同一个专用 Chromium 后开始新检索；登录资料、访问历史和小时额度保留。
+- 登录、验证码、限流、访问封禁、意外页面、人工、访问历史损坏及未知原因的暂停，只有操作者明确处理后才运行 `uv run rednotebook-browser resume`。此命令保留访问历史，不立即打开页面。`uv run rednotebook-browser pause` 可在服务运行时设置人工暂停标记。
+- 手动点开的笔记会留下全屏详情弹层。实测确认 `browser_status.state=ready` 时这是正常路由状态，下一次明确请求的 `page.goto` 可直接替换它，不应先点击关闭控件。若访问已经因其他原因持久暂停，操作者可运行 `uv run rednotebook-browser recover-ui` 返回历史上一页，再显式运行 `resume`；前一个命令不会解除暂停。
 
 后续真实验收应从单篇、少量动作开始，首个异常即结束整轮，不自动转向下一篇。当前107项离线测试通过（19项浏览器/MCP），覆盖跨实例访问间隔、持久暂停、详情失败阻断后续任务、小时预算及签名链接选择。真实详情/多图采集仍未通过，不能将离线用例当作风控修复已在线验证。
 
@@ -111,7 +112,7 @@ P1–P5第一版代码已实现；P6离线与MCP协议验收见后续记录。�
 
 会话由独立浏览器进程持有，默认配置路径固定为private/browser-profile；进程元数据不包含Cookie。MCP结束或CLI退出只卸载控制并断开，明确browser_close或rednotebook-browser close才关闭专用浏览器。不会导出登录Cookie给Agent，不复制日常Chrome资料，不刷新网页来“保活”，不修改或延长平台会话期限。平台主动使会话失效时仍需手动登录。
 
-状态检测把automation state与authentication分开：存在登录弹窗时为login_required；明确看到“我”入口才为logged_in；仅仅没有弹窗仍为unknown。即使已登录，也不会自动清除先前的持久暂停。status连接已有浏览器但不创建浏览器或导航。
+状态检测把automation state与authentication分开：存在登录弹窗时为login_required；明确看到“我”入口才为logged_in；仅仅没有弹窗仍为unknown。登录状态本身不会清除暂停；只有新的显式检索可按上述白名单复位本地失败暂停。status连接已有浏览器但不创建浏览器或导航。
 
 ```bash
 uv run rednotebook-browser --db private/browser-research.sqlite status
@@ -121,3 +122,13 @@ uv run rednotebook-browser --db private/browser-research.sqlite close
 111项离线测试通过。新增专用浏览器断开/重连后保持标签页、只读连接不启动浏览器、会话元数据校验、登录正向证据及暂停状态独立性测试。SQLite仍为schema6，未新增证据表；会话配置与登录状态独立于研究来源，清理方式见前述专用profile说明。
 
 连接机制参考 [Playwright connect_over_cdp](https://playwright.dev/python/docs/api/class-browsertype#browser-type-connect-over-cdp) 与 [Browser.close连接断开行为](https://playwright.dev/python/docs/api/class-browser#browser-close)。该验证只覆盖登录保持，不代替此前尚未完成的真实详情采集验收。
+
+### v0.6.0 多轮故障复现与修复
+
+2026-09-17 使用同一专用profile和已登记来源进行有界MCP测试。三次连续状态读取均为ready/logged_in；第一次搜索返回2个有界候选，纯文字详情取得1条记录。详情页保持 `.note-detail-mask` 可见。曾尝试把“先关闭弹层”设为导航前置条件，真实页面的关闭控件/遮罩及SPA生命周期等待均产生假失败，并触发 `note_overlay_close_failed` 暂停。撤销这个前置条件后，再次纯文字详情成功，随后从可见详情弹层直接搜索也成功，最终仍为ready。
+
+根因不是Skill主动停止，而是服务原先对错误分类过宽：任何浏览器任务 `DomainError` 和任何partial采集错误都会写入全局暂停标记，随后Skill按规则停止。现在只有登录、验证码、限流、访问拒绝、意外页面等明确访问状态会由DomainError写入安全暂停；总任务超时、契约错误和未知异常写入可由下一次新检索复位的失败暂停。详情缺失、搜索结果DOM缺失、路由/分页局部失败只结束当前任务。导航的Playwright超时与一般错误也分别映射为不含页面内容或签名URL的结构化错误码。Skill与MCP说明同步要求：任务失败后只检查一次status，不自动重试；若 `new_search_reset_available=true`，等待用户明确的新检索，其余暂停交给操作者。
+
+图片测试识别到6页，但旧循环在读取当前可见图片前先点击第1个已选中分页点，返回 `image_pagination_not_interactive`，0张保存。浏览器保持ready，随后另一轮搜索成功，证明partial不再锁死后续访问。代码改为第1张直接读取、仅第2张起点击分页，并在调用方图片上限小于已知总数时返回 `image_limit_reached`。第一次复测又发现详情刚打开时图片仍是临时占位URL；随后同一6图笔记以 `max_images=1` 成功保存1张，以 `max_images=2` 成功保存并翻到第2张，两次都仅因明确预算上限返回 `image_limit_reached`，浏览器保持ready。两次完整6页尝试在15秒/30秒等待后仍偶发 `image_not_ready`，但任务结束后的只读检查立即发现允许的CDN地址，说明等待浏览器完成像素解码不是稳定条件。最终改为从真实页面的 `currentSrc/src` 选择允许的 `*.xhscdn.com` 地址后直接交给受限下载器，并增加“图片未解码但CDN src已存在”的离线回归；按约定未再发起线上重试，因此完整6张仍未在线验收。
+
+当前项目176项测试（其中36项浏览器用例）、Ruff、格式、脚手架和基础验证全部通过。新增离线用例覆盖失败后新检索复位、失败任务重试仍被拒绝、无效新检索不复位，以及登录/验证码/限流/封禁/意外页面/人工/用户报告限制等安全暂停不复位；本轮没有为验证复位而触发真实网页故障。浏览器只读诊断为未暂停、小时额度仍有余量。操作者将小时导航额度从10放宽到60；仍保留60秒导航间隔及3秒页面动作间隔，额度耗尽只返回等待而不写持久暂停。

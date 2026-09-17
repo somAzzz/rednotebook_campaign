@@ -4,12 +4,15 @@ import argparse
 import asyncio
 import fcntl
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from functools import wraps
 from pathlib import Path
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import CallToolResult, TextContent
 from pydantic import ValidationError
 
 from rednotebook import creative, workspace
@@ -19,7 +22,7 @@ from rednotebook.errors import DomainError
 from rednotebook.importing import validation_issues
 from rednotebook.research.config import research_budget
 from rednotebook.storage import Database
-from rednotebook.util import canonical
+from rednotebook.util import canonical, stamp
 
 
 def safe(fn):
@@ -28,15 +31,16 @@ def safe(fn):
         try:
             return await fn(*args, **kwargs)
         except DomainError as exc:
-            return {"state": "failed", "error_code": exc.code}
+            return {"state": "failed", "error_code": exc.code, "_execution_error": True}
         except ValidationError as exc:
             return {
                 "state": "failed",
                 "error_code": "input_contract_invalid",
+                "_execution_error": True,
                 "issues": validation_issues(exc),
             }
         except Exception:
-            return {"state": "failed", "error_code": "operation_failed"}
+            return {"state": "failed", "error_code": "operation_failed", "_execution_error": True}
 
     return wrapper
 
@@ -44,9 +48,64 @@ def safe(fn):
 class SafeMCP(FastMCP):
     async def call_tool(self, name, arguments):
         try:
-            return await super().call_tool(name, arguments)
+            # Return the SDK's native result so isError reflects execution, not a payload convention.
+            result = await self._tool_manager.call_tool(
+                name, arguments, context=self.get_context(), convert_result=False
+            )
         except (ToolError, ValidationError):
-            return {"state": "failed", "error_code": "tool_input_or_execution_invalid"}
+            result = {
+                "state": "failed",
+                "error_code": "tool_input_or_execution_invalid",
+                "_execution_error": True,
+            }
+        except Exception:
+            result = {"state": "failed", "error_code": "operation_failed", "_execution_error": True}
+        # Reading a failed job/report succeeded. A failed direct operation did not.
+        failed = result.get("state") == "failed" and (
+            name not in {"get_job", "read_research"} or result.get("_execution_error", False)
+        )
+        result.pop("_execution_error", None)
+        if failed:
+            operator = result.get("error_code") in {
+                "browser_access_paused",
+                "captcha_required",
+                "login_required",
+                "access_blocked",
+                "browser_operation_failed",
+                "rate_limited",
+            }
+            stage = name if name in {t.name for t in await self.list_tools()} else "unknown_tool"
+            result = {
+                **result,
+                "error_stage": stage,
+                "diagnostic_id": str(uuid4()),
+                "requires_operator_action": operator,
+                "retryable": False,
+                "retry_requires_operator_action": operator,
+                "safe_next_action": result.get("safe_next_action")
+                or ("operator_resolve_and_resume" if operator else "inspect_input_and_state"),
+            }
+            try:
+                db = self.diagnostic_db
+                with db.conn:
+                    db.conn.execute(
+                        "DELETE FROM diagnostic_events WHERE created_at<?",
+                        (stamp(db.clock() - timedelta(days=30)),),
+                    )
+                    db.conn.execute(
+                        "INSERT INTO diagnostic_events VALUES (?,?,?,?)",
+                        (result["diagnostic_id"], stage, result["error_code"], stamp(db.clock())),
+                    )
+            except Exception:
+                # Diagnostic failure must not leak SQL or replace the original safe error.
+                result["diagnostic_recorded"] = False
+            else:
+                result["diagnostic_recorded"] = True
+        return CallToolResult(
+            content=[TextContent(type="text", text=canonical(result))],
+            structuredContent=result,
+            isError=failed,
+        )
 
 
 def create_server(service):
@@ -71,12 +130,47 @@ def create_server(service):
         "and bounded candidate presence; it does not prove note body, comments, ranking, or representativeness. "
         "Collect, analyse_gallery, then import_capture before research_notes or making content claims. "
         "Research citations contain program-resolved source metadata and reports contain a deduplicated sources "
-        "list; cite those public_url values. If browser work pauses, stop until the operator explicitly resolves "
-        "the cause and resumes it outside MCP. Video is deferred. "
+        "list; cite those public_url values. If a pause reports access.new_search_reset_available=true, only a "
+        "fresh search_notes or search_with_plan request explicitly requested by the user may reset it; the old "
+        "controller is disconnected, the same dedicated browser session is reconnected, and login data plus "
+        "access history are preserved. Never use retry_job, collect_note, or workflow continuation to reset a pause. "
+        "For login, CAPTCHA, rate limit, access block, unexpected page, operator, unknown, or other safety pauses, "
+        "stop until the operator resolves the cause and resumes it outside MCP. A visible note overlay while "
+        "browser_status is ready is ordinary "
+        "page state; do not close it heuristically because the next requested navigation replaces the route. "
+        "If access.remaining_hourly_navigations is zero, do not submit browser work; report the supplied wait "
+        "time and wait for a later operator-requested run instead of causing a pause marker. "
+        "After a partial or failed browser job, check browser_status once: report a resettable local-failure "
+        "pause and wait for a user-requested fresh search; stop for every other pause. If ready, report the "
+        "task-local failure. Never automatically retry the same job. Video is deferred. "
+        "For exploratory searches use plan_search then search_with_plan, preserving the core query and "
+        "labeling category/scenario results as references, never as evidence about the exact model. "
+        "Use exact_only for a restricted search; search_notes remains an explicit single-query primitive. "
         "Use list_history to recover prior work, workspace_status for diagnosis, and research_workflow for "
         "a staged one-note workflow. Record feedback only on explicit user instruction; never invent approval. "
-        "Never claim draft facts are verified. Formal approval is performed separately via the CLI.",
+        "Use create_campaign for author-led content without mandatory research, generate_campaign for explicit "
+        "local-model planning, and check_campaign for layered review. Preserve multi-project intent and "
+        "optional CTA/measurement. These are local drafting tools, never publishing or interaction tools. "
+        "Never claim draft facts are verified. Author confirmation and formal approval are separate CLI actions.",
     )
+
+    server.diagnostic_db = service.db
+
+    @server.tool()
+    @safe
+    async def read_diagnostic(diagnostic_id: str) -> dict:
+        """Read a content-free error code/stage retained for at most 30 days. No arguments or source text logged."""
+        with service.db.conn:
+            service.db.conn.execute(
+                "DELETE FROM diagnostic_events WHERE created_at<?",
+                (stamp(service.db.clock() - timedelta(days=30)),),
+            )
+        row = service.db.conn.execute(
+            "SELECT * FROM diagnostic_events WHERE id=?", (diagnostic_id,)
+        ).fetchone()
+        if not row:
+            raise DomainError("diagnostic_not_found")
+        return dict(row)
 
     @server.tool()
     @safe
@@ -97,7 +191,7 @@ def create_server(service):
     @server.tool()
     @safe
     async def browser_status() -> dict:
-        """Check visible browser/login/challenge state. Ready does not prove authentication."""
+        """Check browser/login/challenge/note-overlay state. Ready does not prove authentication."""
         if not service.reader.context:
             try:
                 await service.reader.open(attach_only=True)
@@ -141,6 +235,45 @@ def create_server(service):
                 scrolls=scrolls,
             )
         )
+
+    @server.tool()
+    @safe
+    async def plan_search(
+        source_id: str, intent: dict, use_model: bool = False, budget: dict | None = None
+    ) -> dict:
+        """Save a core-first intent plan before browsing. primary_query is preserved verbatim.
+        Optional local model expands categories/angles/scenarios, never verified aliases.
+        user_goal may contain the author's campaign goal. exact_only disables expansion.
+        Poll get_job(include_result=true), inspect/edit intent by making a new plan.
+        """
+        from rednotebook.search_intent import SearchIntent
+
+        return service.submit(
+            JobRequest(
+                operation="plan_search",
+                source_id=source_id,
+                intent=SearchIntent.model_validate(intent),
+                use_model=use_model,
+                budget=research_budget(overrides=budget),
+            )
+        )
+
+    @server.tool()
+    @safe
+    async def search_with_plan(source_id: str, plan_job_id: str) -> dict:
+        """Execute a saved completed plan, core first; deduplicate notes and retain query provenance.
+        Stops on the first query failure, retaining completed results. No auto retry or browser resume.
+        Groups identify retrieval origin, not confirmed relevance; only public_url is user-facing.
+        """
+        return service.submit(
+            JobRequest(operation="search_plan", source_id=source_id, plan_job_id=plan_job_id)
+        )
+
+    @server.resource("rednotebook://schemas/search-intent")
+    def search_intent_schema() -> str:
+        from rednotebook.search_intent import SearchIntent
+
+        return canonical(SearchIntent.model_json_schema())
 
     @server.tool()
     @safe
@@ -238,7 +371,7 @@ def create_server(service):
     @server.tool()
     @safe
     async def retry_job(job_id: str) -> dict:
-        """Explicitly retry paused/failed/interrupted/cancelled job as a new attempt. No automatic login bypass."""
+        """Retry a job as a new attempt without clearing any pause. A fresh search is a separate request."""
         return service.retry(job_id)
 
     @server.tool()
@@ -251,14 +384,15 @@ def create_server(service):
     @safe
     async def revise_draft(bundle_id: str, version: int, editorial: dict) -> dict:
         """Create a new draft revision; never inherit approval after content changes."""
+        row = creative.load_bundle(service.db, bundle_id, version)
         return creative.revise(
-            service.db, bundle_id, version, creative.Editorial.model_validate(editorial)
+            service.db, bundle_id, version, creative.parse_editorial(row["payload"], editorial)
         )
 
     @server.tool()
     @safe
     async def preview_draft(bundle_id: str, version: int) -> dict:
-        """Render six local PNG preview pages with unapproved watermark."""
+        """Render local PNG preview pages with unapproved watermark."""
         return creative.export(service.db, bundle_id, version, preview=True)
 
     @server.tool()
@@ -266,6 +400,69 @@ def create_server(service):
     async def export_draft(bundle_id: str, version: int) -> dict:
         """Export only an exact version already approved through the separate review workflow."""
         return creative.export(service.db, bundle_id, version)
+
+    @server.tool()
+    @safe
+    async def create_campaign(brief: dict) -> dict:
+        """Save ContentBrief and an editable scaffold; research is optional. No model/network call."""
+        from rednotebook.campaign import create
+        from rednotebook.campaign_contracts import ContentBrief
+
+        return create(service.db, ContentBrief.model_validate(brief))
+
+    @server.tool()
+    @safe
+    async def revise_campaign_brief(bundle_id: str, version: int, brief: dict) -> dict:
+        """Version goal/material/series changes; invalidate confirmation and approval."""
+        from rednotebook.campaign import revise_brief
+        from rednotebook.campaign_contracts import ContentBrief
+
+        return revise_brief(service.db, bundle_id, version, ContentBrief.model_validate(brief))
+
+    @server.tool()
+    @safe
+    async def revise_campaign_output(bundle_id: str, version: int, output: dict) -> dict:
+        """Save plan, post and claim mappings together; mapping existence does not prove support."""
+        from rednotebook.campaign import replace_output
+        from rednotebook.campaign_contracts import CampaignOutput
+
+        return replace_output(service.db, bundle_id, version, CampaignOutput.model_validate(output))
+
+    @server.tool()
+    @safe
+    async def generate_campaign(
+        bundle_id: str, version: int, budget: dict | None = None, assess_only: bool = False
+    ) -> dict:
+        """Explicit local-model plan/post generation and semantic review; saves draft before review.
+        On failure read saved_bundle_id/saved_version; never automatically resume a browser.
+        assess_only reviews the current draft without regenerating it. May take several minutes.
+        """
+        from rednotebook.campaign import generate
+        from rednotebook.research.config import load_config
+
+        async with service.model_lock:
+            return await generate(
+                service.db,
+                bundle_id,
+                version,
+                load_config(service.config),
+                research_budget(overrides=budget),
+                assess_only=assess_only,
+            )
+
+    @server.tool()
+    @safe
+    async def check_campaign(bundle_id: str, version: int) -> dict:
+        """Check program structure and separate pending model/author review; optional items are not defects."""
+        from rednotebook.campaign import check
+
+        return check(service.db, bundle_id, version)
+
+    @server.resource("rednotebook://schemas/content-brief")
+    def content_brief_schema() -> str:
+        from rednotebook.campaign_contracts import ContentBrief
+
+        return canonical(ContentBrief.model_json_schema())
 
     @server.tool()
     @safe

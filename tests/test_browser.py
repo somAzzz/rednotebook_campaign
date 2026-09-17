@@ -68,6 +68,7 @@ def allowed(grant):
 class Reader:
     def __init__(self, error=None):
         self.calls = 0
+        self.close_calls = 0
         self.error = error
 
     async def search(self, keyword, limit, scrolls, checkpoint):
@@ -78,7 +79,16 @@ class Reader:
         return {"state": "partial", "candidates": [], "keyword": keyword}
 
     async def close(self):
-        pass
+        self.close_calls += 1
+
+
+class FailingOnceReader(Reader):
+    async def search(self, keyword, limit, scrolls, checkpoint):
+        checkpoint()
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("synthetic local browser failure")
+        return {"state": "partial", "candidates": [], "keyword": keyword}
 
 
 def test_jobs_pause_retry_and_revoke_files(db, grant, tmp_path):
@@ -183,6 +193,8 @@ def test_real_stdio_mcp_initialization(tmp_path):
                 initialized = await client.initialize()
                 assert "public_url" in initialized.instructions
                 assert "collect_url" in initialized.instructions
+                assert "new_search_reset_available" in initialized.instructions
+                assert "Never use retry_job" in initialized.instructions
                 listed = (await client.list_tools()).tools
                 names = {t.name for t in listed}
                 assert {
@@ -207,7 +219,7 @@ def test_real_stdio_mcp_initialization(tmp_path):
                 response = await client.call_tool("workspace_status", {})
                 diagnostic = json.loads(response.content[0].text)
                 assert diagnostic["network_access"] is False
-                assert diagnostic["schema_version"] == 7
+                assert diagnostic["schema_version"] == 9
                 response = await client.call_tool("list_history", {"kind": "notes"})
                 assert json.loads(response.content[0].text)["items"] == []
                 response = await client.call_tool(
@@ -215,6 +227,7 @@ def test_real_stdio_mcp_initialization(tmp_path):
                     {"source_id": "missing", "brief": {"SECRET_SENTINEL": "SECRET_SENTINEL"}},
                 )
                 assert "SECRET_SENTINEL" not in str(response)
+                assert response.isError
                 assert json.loads(response.content[0].text)["issues"]
                 response = await client.call_tool("browser_status", {})
                 assert json.loads(response.content[0].text)["state"] == "closed"
@@ -230,6 +243,7 @@ def test_real_stdio_mcp_initialization(tmp_path):
                 response = await client.call_tool(
                     "search_notes", {"source_id": "missing", "keyword": "test"}
                 )
+                assert response.isError
                 assert json.loads(response.content[0].text)["state"] == "failed"
 
     asyncio.run(run())
@@ -302,7 +316,9 @@ def test_playwright_collect_orders_images_and_skips_video(tmp_path, monkeypatch)
         html += '<div class="pagination-teleport-container">'
         for index, url in enumerate(urls):
             html += (
-                "<button class=\"pagination-item\" onclick=\"document.querySelector('img').src='"
+                '<button class="pagination-item" '
+                + ('style="pointer-events:none" ' if index == 0 else "")
+                + "onclick=\"document.querySelector('img').src='"
                 + url
                 + "'\">"
                 + str(index)
@@ -327,6 +343,7 @@ def test_playwright_collect_orders_images_and_skips_video(tmp_path, monkeypatch)
             assert result["state"] == "partial"
             assert result["declared_total"] == 3
             assert [i["position"] for i in result["images"]] == [1, 2]
+            assert result["errors"] == [{"code": "image_limit_reached"}]
             assert (tmp_path / "01.image").read_bytes() == payloads[urls[0]]
             assert (tmp_path / "02.image").read_bytes() == payloads[urls[1]]
             attempts = []
@@ -396,23 +413,55 @@ def test_navigation_spacing_persists_across_gate_instances(tmp_path):
     asyncio.run(run())
 
 
-def test_detail_failure_stops_following_jobs(db, grant, tmp_path):
+def test_detail_failure_does_not_lock_following_jobs(db, grant, tmp_path):
     async def run():
         db.register_grant(allowed(grant))
         reader = Reader("note_detail_unavailable")
         service = BrowserService(db, tmp_path / "profile", tmp_path / "config", reader)
         job = service.submit(JobRequest(operation="search", source_id=grant.id, keyword="test"))
         await service.tasks[job["job_id"]]
-        with pytest.raises(DomainError, match="browser_access_paused"):
-            service.submit(JobRequest(operation="search", source_id=grant.id, keyword="next"))
-        assert reader.calls == 1
-        assert AccessGate(tmp_path / "profile").status()["paused"] is True
+        assert service.get(job["job_id"])["state"] == "failed"
+        assert service.get(job["job_id"])["error_code"] == "note_detail_unavailable"
+        assert AccessGate(tmp_path / "profile").status()["paused"] is False
+        reader.error = None
+        following = service.submit(
+            JobRequest(operation="search", source_id=grant.id, keyword="next")
+        )
+        await service.tasks[following["job_id"]]
+        assert service.get(following["job_id"])["state"] == "partial"
+        assert reader.calls == 2
         await service.close()
 
     asyncio.run(run())
 
 
-def test_hourly_budget_pauses_without_auto_resume(tmp_path):
+def test_partial_capture_review_does_not_lock_browser(db, grant, tmp_path, monkeypatch):
+    async def run():
+        db.register_grant(allowed(grant))
+        reader = Reader()
+        service = BrowserService(db, tmp_path / "profile", tmp_path / "config", reader)
+
+        async def partial_result(ident, request):
+            return {"state": "partial", "errors": [{"code": "image_limit_reached"}]}
+
+        monkeypatch.setattr(service, "execute", partial_result)
+        job = service.submit(
+            JobRequest(
+                operation="collect",
+                source_id=grant.id,
+                url=NOTE,
+                keyword="test",
+            )
+        )
+        await service.tasks[job["job_id"]]
+        assert service.get(job["job_id"])["state"] == "partial"
+        assert AccessGate(tmp_path / "profile").status()["paused"] is False
+        await service.close()
+
+    asyncio.run(run())
+
+
+def test_hourly_budget_waits_without_persistent_pause(tmp_path):
     async def run():
         now = [1000.0]
 
@@ -420,13 +469,143 @@ def test_hourly_budget_pauses_without_auto_resume(tmp_path):
             now[0] += seconds
 
         gate = AccessGate(tmp_path, clock=lambda: now[0], sleep=sleep)
-        for _ in range(10):
+        for _ in range(AccessGate.HOURLY_PAGE_LIMIT):
             await gate.navigation()
-        with pytest.raises(DomainError, match="browser_access_paused"):
+        status = gate.status()
+        assert status["remaining_hourly_navigations"] == 0
+        assert status["next_navigation_in_seconds"] > 0
+        with pytest.raises(DomainError, match="browser_hourly_budget_wait"):
             await gate.navigation()
+        assert gate.status()["paused"] is False
         now[0] += 3601
+        await gate.navigation()
+
+    asyncio.run(run())
+
+
+def test_service_rejects_exhausted_hourly_budget_without_job_or_pause(db, grant, tmp_path):
+    async def run():
+        db.register_grant(allowed(grant))
+        profile = tmp_path / "profile"
+        gate = AccessGate(profile, clock=lambda: 1000.0)
+        profile.mkdir()
+        gate.history.write_text(json.dumps([1000.0] * gate.HOURLY_PAGE_LIMIT))
+        reader = Reader()
+        reader.gate = gate
+        service = BrowserService(db, profile, tmp_path / "config", reader)
+        with pytest.raises(DomainError, match="browser_hourly_budget_wait"):
+            service.submit(JobRequest(operation="search", source_id=grant.id, keyword="test"))
+        assert db.conn.execute("SELECT count(*) FROM browser_jobs").fetchone()[0] == 0
+        assert gate.status()["paused"] is False
+        await service.close()
+
+    asyncio.run(run())
+
+
+def test_fresh_search_resets_failure_pause_and_preserves_history(db, grant, tmp_path):
+    async def run():
+        db.register_grant(allowed(grant))
+        profile = tmp_path / "profile"
+        gate = AccessGate(profile, clock=lambda: 1000.0)
+        profile.mkdir()
+        gate.history.write_text(json.dumps([900.0]))
+        gate.pause("browser_operation_failed")
+        reader = Reader()
+        reader.gate = gate
+        service = BrowserService(db, profile, tmp_path / "config", reader)
+
+        assert gate.status()["new_search_reset_available"] is True
+        assert gate.status()["resume"] == "fresh_search_or_explicit_operator_cli"
+        job = service.submit(JobRequest(operation="search", source_id=grant.id, keyword="新的检索"))
+        assert job["browser_reset"] == {
+            "reason": "browser_operation_failed",
+            "history_preserved": True,
+        }
+        await service.tasks[job["job_id"]]
+        assert service.get(job["job_id"])["state"] == "partial"
+        assert gate.status()["paused"] is False
+        assert json.loads(gate.history.read_text()) == [900.0]
+        assert reader.calls == 1
+        await service.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "access_blocked",
+        "captcha_required",
+        "login_required",
+        "operator_paused",
+        "rate_limited",
+        "unexpected_page",
+        "user_reported_platform_restriction",
+    ],
+)
+def test_fresh_search_does_not_reset_safety_pause(db, grant, tmp_path, reason):
+    async def run():
+        db.register_grant(allowed(grant))
+        profile = tmp_path / "profile"
+        gate = AccessGate(profile)
+        gate.pause(reason)
+        reader = Reader()
+        reader.gate = gate
+        service = BrowserService(db, profile, tmp_path / "config", reader)
+
+        assert gate.status()["new_search_reset_available"] is False
         with pytest.raises(DomainError, match="browser_access_paused"):
-            await gate.navigation()
+            service.submit(JobRequest(operation="search", source_id=grant.id, keyword="新检索"))
+        assert gate.status()["reason"] == reason
+        assert reader.calls == 0
+        await service.close()
+
+    asyncio.run(run())
+
+
+def test_invalid_search_does_not_clear_failure_pause(db, grant, tmp_path):
+    async def run():
+        db.register_grant(allowed(grant))
+        profile = tmp_path / "profile"
+        gate = AccessGate(profile)
+        gate.pause("browser_operation_failed")
+        reader = Reader()
+        reader.gate = gate
+        service = BrowserService(db, profile, tmp_path / "config", reader)
+
+        with pytest.raises(DomainError, match="search_keyword_required"):
+            service.submit(JobRequest(operation="search", source_id=grant.id))
+        assert gate.status()["reason"] == "browser_operation_failed"
+        assert reader.calls == 0
+        await service.close()
+
+    asyncio.run(run())
+
+
+def test_failed_search_requires_a_fresh_search_instead_of_retry(db, grant, tmp_path):
+    async def run():
+        db.register_grant(allowed(grant))
+        profile = tmp_path / "profile"
+        reader = FailingOnceReader()
+        service = BrowserService(db, profile, tmp_path / "config", reader)
+
+        failed = service.submit(
+            JobRequest(operation="search", source_id=grant.id, keyword="第一次")
+        )
+        await service.tasks[failed["job_id"]]
+        assert service.get(failed["job_id"])["state"] == "failed"
+        assert service.gate.status()["reason"] == "browser_operation_failed"
+        with pytest.raises(DomainError, match="browser_access_paused"):
+            service.retry(failed["job_id"])
+
+        fresh = service.submit(JobRequest(operation="search", source_id=grant.id, keyword="下一次"))
+        assert fresh["browser_reset"]["reason"] == "browser_operation_failed"
+        await service.tasks[fresh["job_id"]]
+        assert service.get(fresh["job_id"])["state"] == "partial"
+        assert service.gate.status()["paused"] is False
+        assert reader.calls == 2
+        assert reader.close_calls == 1
+        await service.close()
 
     asyncio.run(run())
 
@@ -473,6 +652,142 @@ def test_pagination_ignores_hidden_teleport_clone(tmp_path):
             assert await dots.count() == 2
             assert await dots.first.inner_text() == "1"
             await dots.nth(1).click()
+        finally:
+            await reader.close()
+
+    asyncio.run(run())
+
+
+def test_current_platform_image_uses_allowed_src_before_decode(tmp_path):
+    from rednotebook.adapters.browser import CURRENT_IMAGE, BrowserReader
+
+    async def run():
+        reader = BrowserReader(
+            tmp_path / "profile", headless=True, gate=OfflineGate(tmp_path / "profile")
+        )
+        try:
+            await reader.open()
+            await reader.page.route(
+                "https://www.xiaohongshu.com/**",
+                lambda route: route.fulfill(
+                    status=200,
+                    content_type="text/html",
+                    body=(
+                        '<div id="noteContainer"><div class="note-slider-img">'
+                        '<img style="width:400px;height:500px" '
+                        'src="https://sns-webpic-qc.xhscdn.com/synthetic"></div></div>'
+                    ),
+                ),
+            )
+            await reader.page.route("https://*.xhscdn.com/**", lambda route: route.abort())
+            await reader.page.goto("https://www.xiaohongshu.com/explore")
+            assert await reader.page.evaluate(CURRENT_IMAGE) == (
+                "https://sns-webpic-qc.xhscdn.com/synthetic"
+            )
+        finally:
+            await reader.close()
+
+    asyncio.run(run())
+
+
+def test_navigation_replaces_stale_note_route_without_preclick(tmp_path, monkeypatch):
+    from rednotebook.adapters.browser import BrowserReader
+
+    async def run():
+        reader = BrowserReader(
+            tmp_path / "profile", headless=True, gate=OfflineGate(tmp_path / "profile")
+        )
+        try:
+            await reader.open()
+            html = """
+                <div class="note-detail-mask" style="position:fixed;inset:0"
+                  onclick="if(event.target===this)this.remove()">
+                  <button class="close-circle"
+                    onclick="event.stopPropagation()">关闭</button>
+                  <div id="noteContainer" style="position:absolute;inset:24px 190px">
+                    合成笔记弹层
+                  </div>
+                </div>
+            """
+            await reader.page.route(
+                "https://www.xiaohongshu.com/**",
+                lambda route: route.fulfill(status=200, content_type="text/html", body=html),
+            )
+            await reader.page.goto("https://www.xiaohongshu.com/explore")
+            navigated = []
+
+            async def goto(url, **kwargs):
+                assert await reader.page.locator(".note-detail-mask").count() == 1
+                await reader.page.locator(".note-detail-mask").evaluate("e=>e.remove()")
+                navigated.append((url, kwargs))
+
+            async def check():
+                pass
+
+            monkeypatch.setattr(reader.page, "goto", goto)
+            monkeypatch.setattr(reader, "check", check)
+            assert await reader.note_overlay_state() == "visible"
+            await reader.navigate(NOTE)
+            assert navigated[0][0] == NOTE
+            assert navigated[0][1]["wait_until"] == "domcontentloaded"
+            assert await reader.note_overlay_state() == "not_present"
+        finally:
+            await reader.close()
+
+    asyncio.run(run())
+
+
+def test_operator_overlay_recovery_does_not_resume_access(tmp_path):
+    from rednotebook.adapters.browser import BrowserReader
+
+    async def run():
+        gate = OfflineGate(tmp_path / "profile")
+        reader = BrowserReader(tmp_path / "profile", headless=True, gate=gate)
+        try:
+            await reader.open()
+            html = """
+                <div class="note-detail-mask" style="position:fixed;inset:0"
+                  onclick="if(event.target===this)this.remove()">
+                  <button class="close-circle"
+                    onclick="event.stopPropagation()">关闭</button>
+                  <div id="noteContainer" style="position:absolute;inset:24px 190px">
+                    合成笔记弹层
+                  </div>
+                </div>
+            """
+
+            def route_page(route):
+                body = html if route.request.url.endswith("/" + "a" * 24) else "<main>列表页</main>"
+                return route.fulfill(status=200, content_type="text/html", body=body)
+
+            await reader.page.route(
+                "https://www.xiaohongshu.com/**",
+                route_page,
+            )
+            await reader.page.goto("https://www.xiaohongshu.com/explore")
+            await reader.page.goto(NOTE.split("?")[0])
+            gate.pause("browser_operation_failed")
+            assert await reader.dismiss_note_overlay(paced=False) is True
+            assert gate.status()["paused"] is True
+            state = await reader.state()
+            assert state["note_overlay"] == "not_present"
+        finally:
+            await reader.close()
+
+    asyncio.run(run())
+
+
+def test_overlay_preflight_ignores_initial_blank_page(tmp_path):
+    from rednotebook.adapters.browser import BrowserReader
+
+    async def run():
+        reader = BrowserReader(
+            tmp_path / "profile", headless=True, gate=OfflineGate(tmp_path / "profile")
+        )
+        try:
+            await reader.open()
+            assert reader.page.url == "about:blank"
+            assert await reader.dismiss_note_overlay() is False
         finally:
             await reader.close()
 

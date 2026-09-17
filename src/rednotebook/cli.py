@@ -46,6 +46,7 @@ IMPLEMENTED = [
     "analyse",
     "research show",
     "propose",
+    "campaign",
     "bundle",
     "revise",
     "review",
@@ -76,7 +77,10 @@ def parser():
     doctor.add_argument("--profile", type=Path, default=Path("private/browser-profile"))
     doctor.add_argument("--config", type=Path, default=Path("private/model.toml"))
     schema = sub.add_parser("schema", help="输出输入契约的 JSON Schema")
-    schema.add_argument("kind", choices=["brief", "grant", "evidence"])
+    schema.add_argument(
+        "kind",
+        choices=["brief", "grant", "evidence", "content-brief", "campaign-output", "search-intent"],
+    )
     brief = (
         sub.add_parser("brief").add_subparsers(dest="action", required=True).add_parser("validate")
     )
@@ -140,6 +144,29 @@ def parser():
     proposal.add_argument("--research", required=True)
     proposal.add_argument("--generate", action="store_true", help="显式调用本地模型生成创意草案")
     proposal.add_argument("--config", type=Path, default=Path("private/model.toml"))
+    campaign = sub.add_parser("campaign").add_subparsers(dest="action", required=True)
+    for action in (
+        "create",
+        "validate",
+        "revise-brief",
+        "revise-output",
+        "check",
+        "generate",
+        "assess",
+        "confirm",
+        "delete",
+    ):
+        item = campaign.add_parser(action)
+        if action not in {"create", "validate"}:
+            item.add_argument("id")
+            item.add_argument("--version", type=int, required=True)
+        if action in {"create", "validate", "revise-brief", "revise-output", "confirm"}:
+            item.add_argument("--file", type=Path, required=True)
+        if action in {"generate", "assess"}:
+            item.add_argument("--config", type=Path, default=Path("private/model.toml"))
+            item.add_argument("--budget", type=Path, help="Optional ResearchBudget JSON overrides")
+        if action in {"confirm", "delete"}:
+            item.add_argument("--hash", required=True)
     for command in ("bundle", "review", "preview", "export", "retrospective", "revise"):
         item = sub.add_parser(command)
         item.add_argument("id")
@@ -231,9 +258,17 @@ def dispatch(args):
             "sqlite_ok": sqlite_ok,
         }, 0
     if args.command == "schema":
-        return {"brief": ResearchBrief, "grant": SourceGrant, "evidence": EvidenceInput}[
-            args.kind
-        ].model_json_schema(), 0
+        from rednotebook.campaign_contracts import CampaignOutput, ContentBrief
+        from rednotebook.search_intent import SearchIntent
+
+        return {
+            "brief": ResearchBrief,
+            "grant": SourceGrant,
+            "evidence": EvidenceInput,
+            "content-brief": ContentBrief,
+            "campaign-output": CampaignOutput,
+            "search-intent": SearchIntent,
+        }[args.kind].model_json_schema(), 0
     if args.command == "brief":
         brief = load_brief(args.file)
         return {
@@ -304,6 +339,61 @@ def dispatch(args):
             return result, 0 if result["state"] == "complete" else 2
         from rednotebook import creative
 
+        if args.command == "campaign":
+            from rednotebook import campaign
+            from rednotebook.campaign_contracts import (
+                AuthorConfirmation,
+                CampaignOutput,
+                ContentBrief,
+            )
+
+            if args.action in {"create", "validate", "revise-brief"}:
+                brief = ContentBrief.model_validate_json(args.file.read_bytes())
+                if args.action == "validate":
+                    context, _, _, _ = campaign.build_context(db, brief)
+                    return {
+                        "valid": True,
+                        "mode": context["mode"],
+                        "semantic_truth_verified": False,
+                    }, 0
+                if args.action == "create":
+                    return campaign.create(db, brief), 0
+                return campaign.revise_brief(db, args.id, args.version, brief), 0
+            if args.action == "revise-output":
+                return campaign.replace_output(
+                    db,
+                    args.id,
+                    args.version,
+                    CampaignOutput.model_validate_json(args.file.read_bytes()),
+                ), 0
+            if args.action == "check":
+                return campaign.check(db, args.id, args.version), 0
+            if args.action == "delete":
+                return campaign.delete(db, args.id, args.version, args.hash), 0
+            if args.action == "confirm":
+                return campaign.confirm(
+                    db,
+                    args.id,
+                    args.version,
+                    args.hash,
+                    AuthorConfirmation.model_validate_json(args.file.read_bytes()),
+                ), 0
+            budget = (
+                ResearchBudget.model_validate_json(args.budget.read_bytes())
+                if args.budget
+                else ResearchBudget()
+            )
+            result = asyncio.run(
+                campaign.generate(
+                    db,
+                    args.id,
+                    args.version,
+                    load_config(args.config),
+                    budget,
+                    assess_only=args.action == "assess",
+                )
+            )
+            return result, 1 if result.get("state") == "failed" else 0
         if args.command == "asset":
             return creative.add_asset(
                 db, args.id, args.version, args.file, args.owner, args.rights_ref
@@ -319,7 +409,8 @@ def dispatch(args):
         if args.command == "review":
             return creative.review(db, args.id, args.version, args.hash, args.reviewer), 0
         if args.command == "revise":
-            editorial = creative.Editorial.model_validate_json(args.file.read_bytes())
+            row = creative.load_bundle(db, args.id, args.version)
+            editorial = creative.parse_editorial(row["payload"], json.loads(args.file.read_bytes()))
             return creative.revise(db, args.id, args.version, editorial), 0
         if args.command in ("preview", "export"):
             return creative.export(db, args.id, args.version, args.command == "preview"), 0

@@ -1,0 +1,9 @@
+{
+  "primary_query": "rtx pro 6000",
+  "user_goal": "以昂贵显卡为切入点，介绍多个本地AI项目的用途",
+  "exact_only": false,
+  "max_queries": 4,
+  "core_limit": 20,
+  "expansion_limit": 5,
+  "scrolls": 2
+}
