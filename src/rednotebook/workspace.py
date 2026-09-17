@@ -74,7 +74,7 @@ def history(db, kind, query="", limit=20, offset=0, source_id=None):
         raise DomainError("history_window_invalid")
     allowed, _ = db.allowed_sources(source_id)
     items = []
-    if not allowed:
+    if not allowed and kind != "drafts":
         return {"items": [], "next_offset": None}
     # Iterate rows; access checks precede all returned payloads. SQL search is literal,
     # and older observations are not duplicated into the personal library.
@@ -133,15 +133,20 @@ def history(db, kind, query="", limit=20, offset=0, source_id=None):
                     }
                 else:
                     run_id = row["id"] if kind == "research" else row["run_id"]
-                    sources = {
-                        r[0]
-                        for r in db.conn.execute(
-                            "SELECT source_id FROM research_sources WHERE run_id=?", (run_id,)
-                        )
-                    }
-                    if not sources or not sources <= set(allowed):
+                    sources = (
+                        set(creative.bundle_sources(db, row["id"], row["version"]))
+                        if kind == "drafts"
+                        else {
+                            r[0]
+                            for r in db.conn.execute(
+                                "SELECT source_id FROM research_sources WHERE run_id=?", (run_id,)
+                            )
+                        }
+                    )
+                    if not sources <= set(allowed) or (source_id and source_id not in sources):
                         continue
-                    read_run(db, run_id)
+                    if kind == "research":
+                        read_run(db, run_id)
                     if kind == "research":
                         item = {
                             "run_id": run_id,
@@ -155,6 +160,11 @@ def history(db, kind, query="", limit=20, offset=0, source_id=None):
                             "bundle_id": row["id"],
                             "version": row["version"],
                             "run_id": run_id,
+                            "kind": bundle["payload"].get("kind", "research"),
+                            "series_id": (
+                                bundle["payload"].get("context", {}).get("brief", {}).get("series")
+                                or {}
+                            ).get("id"),
                             "title": bundle["payload"]["editorial"]["title"],
                             "state": row["state"],
                             "created_at": row["created_at"],

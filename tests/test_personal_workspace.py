@@ -301,6 +301,9 @@ def test_schema_six_migration_preserves_existing_jobs(tmp_path, grant, clock):
     path = tmp_path / "upgrade.sqlite"
     with Database(path, clock=lambda: clock[0]) as db:
         db.register_grant(grant)
+        db.conn.execute("DROP TABLE diagnostic_events")
+        db.conn.execute("DROP TABLE bundle_sources")
+        db.conn.execute("DROP TABLE bundle_runs")
         db.conn.execute("DROP TABLE finding_reviews")
         db.conn.execute("ALTER TABLE browser_jobs DROP COLUMN progress_json")
         db.conn.execute("PRAGMA user_version=6")
@@ -310,7 +313,7 @@ def test_schema_six_migration_preserves_existing_jobs(tmp_path, grant, clock):
         )
         db.conn.commit()
     with Database(path, clock=lambda: clock[0]) as db:
-        assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 9
         assert db.conn.execute("SELECT id,progress_json FROM browser_jobs").fetchone()[0] == "old"
         assert db.require_source(grant.id).id == grant.id
 

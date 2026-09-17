@@ -24,7 +24,7 @@
   "pacing": {
     "navigation_interval_seconds": 60,
     "action_interval_seconds": 3,
-    "hourly_page_budget": 10,
+    "hourly_page_budget": 60,
     "platform_safe_rate_claim": false
   },
   "latest_single_note_attempt": {

@@ -44,11 +44,17 @@ DETAIL_DOM = """() => {
 }"""
 CURRENT_IMAGE = """() => {
  const root=document.querySelector('#noteContainer'); if(!root) return null;
+ const platform=location.hostname==='www.xiaohongshu.com';
+ const allowed=src=>{try{const u=new URL(src);return u.protocol==='https:'&&u.hostname.endsWith('.xhscdn.com');}catch{return false;}};
  const candidates=Array.from(root.querySelectorAll('.note-slider-img img')).map(e=>{
  const r=e.getBoundingClientRect(); const p=e.parentElement.getBoundingClientRect();
  const visible=Math.max(0,Math.min(r.right,innerWidth,p.right)-Math.max(r.left,0,p.left));
- return {src:e.currentSrc,visible,loaded:e.complete&&e.naturalWidth>0};
- }).filter(e=>e.loaded&&e.visible>100).sort((a,b)=>b.visible-a.visible);
+ const src=platform ? [e.currentSrc,e.src,e.getAttribute('src')].find(allowed) : e.currentSrc;
+ return {src:src||'',visible,loaded:e.complete&&e.naturalWidth>0};
+ }).filter(e=>{
+  if(e.visible<=100) return false;
+  return platform ? allowed(e.src) : e.loaded;
+ }).sort((a,b)=>b.visible-a.visible);
  return candidates[0]?.src || null;
 }"""
 
@@ -232,12 +238,56 @@ class BrowserReader:
             return {"authentication": "logged_in", "evidence": "visible_account_navigation"}
         return {"authentication": "unknown", "evidence": "account_navigation_not_detected"}
 
+    async def note_overlay_state(self):
+        """Inspect only the known note-detail shell, never the note's source text."""
+        if not self.page or self.page.is_closed():
+            return "unknown"
+        try:
+            visible = self.page.locator(".note-detail-mask:visible #noteContainer:visible")
+            return "visible" if await visible.count() else "not_present"
+        except PlaywrightError:
+            return "unknown"
+
+    async def dismiss_note_overlay(self, *, paced=True):
+        """Operator recovery: leave one stale note route without clearing a pause."""
+        if not self.page or self.page.is_closed():
+            raise DomainError("browser_session_not_running")
+        if urlsplit(self.page.url).hostname != "www.xiaohongshu.com":
+            return False
+        mask = self.page.locator(".note-detail-mask:visible").first
+        if not await mask.count() or not await mask.locator("#noteContainer:visible").count():
+            return False
+        if paced:
+            await self.gate.action()
+        try:
+            # Closing controls/backdrop clicks can leave the direct detail route
+            # mounted. Operator recovery returns to the prior route explicitly.
+            await self.page.go_back(wait_until="commit", timeout=10000)
+        except (PlaywrightError, PlaywrightTimeoutError):
+            # SPA history can change the route without producing a navigation
+            # lifecycle event. The observed UI state is authoritative here.
+            if await self.note_overlay_state() == "not_present":
+                return True
+            raise DomainError("note_overlay_recovery_failed") from None
+        try:
+            await mask.wait_for(state="hidden", timeout=5000)
+        except (PlaywrightError, PlaywrightTimeoutError):
+            if await self.note_overlay_state() == "not_present":
+                return True
+            raise DomainError("note_overlay_recovery_failed") from None
+        return True
+
     async def state(self):
+        overlay = await self.note_overlay_state()
         if self.gate.status()["paused"]:
             return {
                 "state": "paused",
                 "reason": "browser_access_paused",
                 "access": self.gate.status(),
+                "note_overlay": overlay,
+                "operator_recovery": "recover_ui_then_explicit_resume"
+                if overlay == "visible"
+                else None,
             } | await self.authentication_state()
         if not self.page or self.page.is_closed():
             return {"state": "closed"}
@@ -251,7 +301,11 @@ class BrowserReader:
             return {"state": "paused", "reason": "login_required"}
         if urlsplit(self.page.url).hostname != "www.xiaohongshu.com":
             return {"state": "paused", "reason": "unexpected_page"}
-        return {"state": "ready"} | await self.authentication_state()
+        return {
+            "state": "ready",
+            "note_overlay": overlay,
+            "access": self.gate.status(),
+        } | await self.authentication_state()
 
     async def check(self):
         state = await self.state()
@@ -261,12 +315,22 @@ class BrowserReader:
     async def navigate(self, url):
         await self.gate.navigation()
         await self.open()
-        response = await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        # page.goto replaces the current route directly. A note overlay is page
+        # state, not an access-risk signal and not a prerequisite to navigation.
+        try:
+            response = await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        except PlaywrightTimeoutError:
+            await self.check()
+            raise DomainError("browser_navigation_timeout") from None
+        except PlaywrightError:
+            await self.check()
+            raise DomainError("browser_navigation_failed") from None
         if response and response.status in {401, 403, 429}:
-            self.gate.pause("platform_access_rejected")
-            raise DomainError(
-                {401: "login_required", 403: "access_blocked", 429: "rate_limited"}[response.status]
-            )
+            code = {401: "login_required", 403: "access_blocked", 429: "rate_limited"}[
+                response.status
+            ]
+            self.gate.pause(code)
+            raise DomainError(code)
         await self.check()
 
     async def search(self, keyword, limit=10, scrolls=3, checkpoint=lambda: None):
@@ -412,15 +476,23 @@ class BrowserReader:
             for position in range(1, min(total, max_images) + 1):
                 checkpoint()
                 await self.check()
-                await self.gate.action()
+                # The first image is already selected. Its active pagination
+                # marker may intentionally be non-interactive.
+                if position > 1:
+                    await self.gate.action()
+                    try:
+                        await dots.nth(position - 1).click()
+                    except PlaywrightTimeoutError:
+                        errors.append(
+                            {"position": position, "code": "image_pagination_not_interactive"}
+                        )
+                        break
+                    await asyncio.sleep(0.4)
                 try:
-                    await dots.nth(position - 1).click()
+                    await self.page.wait_for_function(CURRENT_IMAGE, timeout=30000)
                 except PlaywrightTimeoutError:
-                    errors.append(
-                        {"position": position, "code": "image_pagination_not_interactive"}
-                    )
+                    errors.append({"position": position, "code": "image_not_ready"})
                     break
-                await asyncio.sleep(0.4)
                 src = await self.page.evaluate(CURRENT_IMAGE)
                 try:
                     data = await download_image(client, src)
@@ -446,6 +518,8 @@ class BrowserReader:
                         }
                     )
                     break
+        if total > max_images and not errors:
+            errors.append({"code": "image_limit_reached"})
         checkpoint()
         return {
             "state": "partial" if errors or len(images) != total else "complete",
