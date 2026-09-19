@@ -152,6 +152,11 @@ def test_plan_then_search_dedup_provenance_and_revocation(db, grant, tmp_path):
         result = service.get(job["job_id"], True)["result"]
         assert reader.calls[0] == "rtx pro 6000" and len(reader.calls) == 4
         assert result["execution_complete"] and result["state"] == "partial"
+        assert (
+            service.get(job["job_id"])["progress"]["completed_queries"]
+            == result["completed_queries"]
+            == 4
+        )
         assert len(result["candidates"]) == 1
         c = result["candidates"][0]
         assert len(c["hits"]) == 4 and c["groups"][0] == "core"
@@ -180,6 +185,16 @@ def test_first_failure_stops_expansions_keeps_checkpoint(db, grant, tmp_path):
         saved = service.get(job["job_id"], True)
         assert saved["state"] == "paused" and len(reader.calls) == 2
         assert saved["result"]["completed_queries"] == 1
+        assert saved["progress"]["completed_queries"] == 1
+        assert saved["recovery"]["next_action"] == "resolve_pause_then_explicit_operator_resume"
+        service.gate.pause("browser_job_timeout")
+        refreshed = service.get(job["job_id"], True)
+        assert (
+            refreshed["recovery"]["next_action"]
+            == refreshed["browser_access"]["resume"]
+            == "fresh_search_or_explicit_operator_cli"
+        )
+        service.gate.pause("captcha_required")
         assert len(saved["result"]["candidates"]) == 1
         with pytest.raises(DomainError, match="browser_access_paused"):
             service.retry(job["job_id"])
@@ -243,7 +258,7 @@ def test_migration_v8_keeps_legacy_jobs_and_enables_contract(tmp_path, grant):
         db.conn.commit()
     with Database(path) as db:
         assert tuple(db.conn.execute("SELECT * FROM browser_jobs").fetchone()) == original
-        assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 13
         assert (
             db.conn.execute(
                 "SELECT value FROM settings WHERE key='search_plan_contract_version'"

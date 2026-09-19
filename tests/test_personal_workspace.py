@@ -75,13 +75,15 @@ class CaptureReader:
             "metrics": {},
             "comments": [],
             "has_images": False,
+            "identity": {"state": "verified", "note_id": url.split("/explore/")[1].split("?")[0]},
+            "body_check": {"state": "complete"},
         }
         value = {
             "state": "partial",
             "raw": raw,
             "images": [],
             "declared_total": None,
-            "errors": [{"code": "capture_in_progress"}],
+            "errors": [],
         }
         on_progress(value, "text_saved")
         self.saved.set()
@@ -119,7 +121,7 @@ def test_capture_failure_keeps_checkpoint_and_explicit_partial_import(db, grant,
         job = service.get(ident, True)
         assert job["state"] in {"failed", "paused"}
         assert job["recovery"]["saved_capture_available"]
-        assert job["progress"]["stage"] == "text_saved"
+        assert job["progress"].get("failed_stage", job["progress"]["stage"]) == "text_saved"
         assert "SENTINEL" not in json.dumps(job)
         with pytest.raises(DomainError, match="partial_capture_requires_explicit_import"):
             service.import_capture(ident, False)
@@ -313,7 +315,7 @@ def test_schema_six_migration_preserves_existing_jobs(tmp_path, grant, clock):
         )
         db.conn.commit()
     with Database(path, clock=lambda: clock[0]) as db:
-        assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 13
         assert db.conn.execute("SELECT id,progress_json FROM browser_jobs").fetchone()[0] == "old"
         assert db.require_source(grant.id).id == grant.id
 
@@ -366,6 +368,9 @@ def test_real_playwright_local_gallery_workflow(db, grant, tmp_path, monkeypatch
             tmp_path / "profile", headless=True, gate=OfflineGate(tmp_path / "profile")
         )
         await reader.open()
+        from test_browser import offline_note_location
+
+        offline_note_location(reader, NOTE)
         payloads = {}
         for color in ("red", "blue"):
             output = BytesIO()
@@ -374,7 +379,7 @@ def test_real_playwright_local_gallery_workflow(db, grant, tmp_path, monkeypatch
             payloads[url] = output.getvalue()
         urls = list(payloads)
         html = (
-            '<div id="noteContainer"><div id="detail-title">合成标题</div><div id="detail-desc">合成问题</div><div class="note-slider-img"><img src="'
+            '<div id="noteContainer" data-note-id="bbbbbbbbbbbbbbbbbbbbbbbb"><div id="detail-title">合成标题</div><div id="detail-desc">合成问题</div><div class="note-slider-img"><img src="'
             + urls[0]
             + '"></div></div><div class="pagination-teleport-container">'
         )

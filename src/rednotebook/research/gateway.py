@@ -79,6 +79,8 @@ class EvidenceGateway:
             if pinned["kind"] == "comment"
             else "标题"
             if citation.field == "title"
+            else "标题回填（正文为空）"
+            if record["content"].get("text_origin") == "title_fallback"
             else "正文",
         }
 
@@ -116,6 +118,9 @@ class EvidenceGateway:
                 "span": {"start": ref.start, "end": ref.end},
                 "machine_extracted": ref.field == "media_text",
                 "text": ref.excerpt,
+                "text_origin": self.by_id[ref.evidence_id]["content"].get(
+                    "text_origin", "unspecified"
+                ),
                 "text_truncated": self.max_chars
                 < len(self.by_id[ref.evidence_id]["content"][ref.field]),
                 "is_author_reply": self.by_id[ref.evidence_id]["content"]["is_author_reply"],

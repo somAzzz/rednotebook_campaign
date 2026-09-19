@@ -33,7 +33,9 @@ PROMPT = """你是作者的中文内容策划助手。根据 CreativeContext 生
 作者陈述不自动等于核验。缺少成果材料仅表示本轮未提供，不能写成项目没有成果；用途扩展仅能作为明确的建议或例子，不能当成作者已定功能。研究发现是待核验假设，搜索候选不支持正文、评论或效果规律。
 禁止虚构亲身经历、产品效果、购买事实或结果。按承诺scope区分本帖交付、资源、未来和结果。
 内部候选话题只进入plan.next_topics；除非作者目标明确要求对外预告或存在future承诺，不把候选写成post中“下期将发布”的保证。
+结合多篇研究比较共同点、分歧、限制与尚无依据的问题，在plan.material_gaps记录缺口；作者自己的目标和材料决定发布稿主线，不能把单篇作者自述升级为普遍事实。
 不保证爆款，不推断因果。素材仅可引用available_assets的ID。
+不要把“计划口径、未支付、未实测、不承诺票数”等内部检查逐页复述；在相关位置自然说明一次，保留真正影响理解的限制。避免“预算口径与系列结构”等内部管理用语。
 发布稿面向读者，不夹带研究日志；需要的事实边界以自然表述说明。正文不必复述图片。
 available_assets仅包含元数据，不代表模型已看过图片；不得据此虚构画面。
 重要事实声称放入claims，以dependency_ids映射dependency_index；存在引用不证明语义支持。
@@ -49,6 +51,7 @@ REVIEW_PROMPT = """审阅所给创作输出与 CreativeContext 的一致性，�
 没有具体疑点时issues=[]，作者确认由程序单独执行，不要为已匹配的每个字段重复制造needs_review。
 未提供可选图片、CTA、基线不产生warn；无依据的假想平台要求不产生warn。
 内部候选被写成作者未要求的未来发布保证时才提示承诺越界；作者明确要求的预告可保留。
+检查重复免责声明、内部管理用语和空泛概览是否挤占读者价值；这类表达问题用warn且factual=false。
 不要求作者材料模式假装经过样本验证。此审阅不能替代作者确认。"""
 
 
@@ -60,11 +63,87 @@ def build_context(db, brief, assets=None):
         for item in getattr(brief, group):
             index[f"{group}:{item.id}"] = item.model_dump(mode="json")
     sources = set(brief.source_ids)
+    run_ids = list(brief.research_run_ids)
+    workflow = {}
+    for job_id, operation in (
+        (brief.search_job_id, "search_plan"),
+        (brief.topic_job_id, "topic_research"),
+    ):
+        if not job_id:
+            continue
+        row = db.conn.execute("SELECT * FROM browser_jobs WHERE id=?", (job_id,)).fetchone()
+        if not row:
+            raise DomainError("campaign_workflow_not_found")
+        db.require_source(row["source_id"], "storage")
+        db.require_source(row["source_id"])
+        request = json.loads(row["request_json"])
+        result = json.loads(row["result_json"]) if row["result_json"] else {}
+        if request["operation"] != operation:
+            raise DomainError("campaign_workflow_type_mismatch")
+        sources.add(row["source_id"])
+        if operation == "topic_research":
+            if (
+                row["state"] != "complete"
+                or not result.get("campaign_ready")
+                or not result.get("notes")
+                or any(
+                    n.get("result", {}).get("completeness", {}).get("capture_gate") != "passed"
+                    or n.get("result", {}).get("completeness", {}).get("image_reading")
+                    not in {"complete", "not_applicable"}
+                    for n in result["notes"]
+                )
+            ):
+                raise DomainError("campaign_detail_research_incomplete")
+            run_ids.extend(result["research_run_ids"])
+            workflow["topic"] = {
+                k: result[k]
+                for k in (
+                    "selection",
+                    "candidate_count",
+                    "selected_count",
+                    "completed_count",
+                    "requested_depth",
+                    "achieved_depth",
+                    "limitations",
+                )
+            }
+            workflow["topic"]["job_id"] = job_id
+            workflow["topic"]["reading_scopes"] = [
+                {
+                    "note_id": n["note_id"],
+                    "public_url": n.get("public_url"),
+                    "reading_scope": n["result"].get("reading_scope"),
+                    "gallery": n["result"].get("gallery"),
+                    "run_id": n["result"]["run_id"],
+                }
+                for n in result["notes"]
+            ]
+        else:
+            if not result.get("execution_complete"):
+                raise DomainError("campaign_search_incomplete")
+            workflow["search"] = {
+                "job_id": job_id,
+                "depth": "search_only",
+                "candidates": [
+                    {
+                        k: c.get(k)
+                        for k in ("note_id", "title", "public_url", "hits", "metric_display")
+                    }
+                    for c in result["candidates"]
+                ],
+                "limitations": result["limitations"],
+            }
+    if brief.research_mode == "research_then_plan" and not brief.topic_job_id:
+        raise DomainError("campaign_detail_research_required")
+    if brief.research_mode == "search_only" and not brief.search_job_id:
+        raise DomainError("campaign_search_required")
+    if brief.research_mode == "author_only" and (run_ids or sources):
+        raise DomainError("campaign_author_only_has_external_sources")
     research = []
     citations = []
     found = set()
     synthetic = brief.synthetic
-    for run_id in dict.fromkeys(brief.research_run_ids):
+    for run_id in dict.fromkeys(run_ids):
         report = findings_for_draft(db, run_id)
         if report.get("state") not in {"complete", "partial"}:
             raise DomainError("campaign_research_not_ready")
@@ -129,10 +208,15 @@ def build_context(db, brief, assets=None):
         "synthetic": synthetic,
         "brief": brief.model_dump(mode="json"),
         "research": research,
+        "workflow": workflow,
         "dependency_index": index,
         "available_assets": available,
         "source_data_untrusted": True,
-        "mode": "research_assisted" if brief.research_run_ids else "author_materials",
+        "mode": "research_assisted"
+        if run_ids
+        else "search_assisted"
+        if brief.search_job_id
+        else "author_materials",
     }
     return context, sorted(sources), citations, synthetic
 
@@ -179,7 +263,12 @@ def create(db, brief):
         "generation": {"stage": "scaffold", "factual_review": "pending"},
     }
     return creative.save_bundle(
-        db, str(uuid4()), None, payload, source_ids=sources, run_ids=brief.research_run_ids
+        db,
+        str(uuid4()),
+        None,
+        payload,
+        source_ids=sources,
+        run_ids=[r["run_id"] for r in context["research"]],
     )
 
 
@@ -227,7 +316,12 @@ def revise_brief(db, bundle_id, version, brief):
     payload["generation"] = {"stage": "brief_changed_draft_needs_revision"}
     # A smaller page limit is resolved by revising the draft, not silently deleting pages.
     return creative.save_bundle(
-        db, bundle_id, row["run_id"], payload, source_ids=sources, run_ids=brief.research_run_ids
+        db,
+        bundle_id,
+        row["run_id"],
+        payload,
+        source_ids=sources,
+        run_ids=[r["run_id"] for r in context["research"]],
     )
 
 
@@ -239,6 +333,7 @@ def replace_output(db, bundle_id, version, output):
         campaign_plan=output.plan.model_dump(),
         editorial=output.post.model_dump(),
         claims=[c.model_dump() for c in output.claims],
+        generation={"stage": "external_editorial_revision", "factual_review": "pending"},
     )
     invalidate_confirmation(payload)
     validate_output(payload)

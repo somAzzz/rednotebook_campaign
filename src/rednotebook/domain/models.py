@@ -128,7 +128,9 @@ class ResearchBrief(Contract):
 
 
 class Metric(Contract):
-    name: Literal["likes", "saves", "comments", "shares", "views", "impressions", "clicks"]
+    name: Literal[
+        "likes", "saves", "comments", "shares", "views", "impressions", "clicks", "replies"
+    ]
     value: Annotated[float, Field(ge=0, le=2**53 - 1, allow_inf_nan=False, strict=True)] | None
     raw_display: str | None = None
     source_kind: Literal["public", "owner", "estimate"]
@@ -209,7 +211,10 @@ class EvidenceInput(Contract):
     kind: Literal["note", "comment"]
     parent_external_id: Text | None = None
     title: str = ""
-    text: Text
+    text: str
+    text_origin: Literal["unspecified", "body", "title_fallback", "empty_body", "comment"] = (
+        "unspecified"
+    )
     locator: Text
     author_id: Text | None = None
     observed_at: Timestamp
@@ -235,14 +240,20 @@ class EvidenceInput(Contract):
 
     @model_validator(mode="after")
     def consistency(self):
+        if not self.text.strip() and not (
+            self.kind == "note" and self.format == "image_text" and self.text_origin == "empty_body"
+        ):
+            raise ValueError("blank_text_requires_explicit_image_only_note")
         if self.kind == "comment" and not self.parent_external_id:
             raise ValueError("comment requires root note parent_external_id")
         if self.kind == "note" and (
             self.parent_external_id or self.is_reply or self.is_author_reply
         ):
             raise ValueError("note cannot be a reply or have a parent")
-        if self.kind == "comment" and (self.coverage or self.metrics):
-            raise ValueError("coverage and note metrics belong to notes only")
+        if self.kind == "comment" and (
+            self.coverage or any(m.name not in {"likes", "replies"} for m in self.metrics)
+        ):
+            raise ValueError("comments allow only likes and replies metrics, not note coverage")
         if self.published_at and self.published_at > self.observed_at:
             raise ValueError("published_at is later than observation")
         if len({m.name for m in self.metrics}) != len(self.metrics):

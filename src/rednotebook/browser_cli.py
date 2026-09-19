@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 from pydantic import ValidationError
 
 from rednotebook.browser_control import AccessGate
+from rednotebook.browser_deadline import browser_deadline
 from rednotebook.browser_service import BrowserService, JobRequest
 from rednotebook.errors import DomainError
 from rednotebook.search_intent import SearchIntent
@@ -17,6 +18,13 @@ from rednotebook.util import canonical
 
 
 async def run(args, db):
+    if args.action in {"status", "close", "recover-ui"}:
+        async with browser_deadline(90, "browser_control_timeout"):
+            return await _run(args, db)
+    return await _run(args, db)
+
+
+async def _run(args, db):
     service = BrowserService(db, args.profile, args.config)
     try:
         if args.action in {"status", "close", "recover-ui"}:
@@ -70,8 +78,24 @@ async def run(args, db):
                     } | auth
                 await asyncio.sleep(2)
             return {"state": "closed", "profile": "dedicated_persistent_profile"}
+        if args.action == "authorize-caller":
+            from rednotebook.research.assistant_review import record_consent
+
+            consent = record_consent(
+                service, args.capture_id, args.statement_file.read_text(), args.processor
+            )
+            return {
+                "state": "complete",
+                "capture_id": consent["capture_id"],
+                "processor": consent["processor"],
+                "scope": consent["scope"],
+            }
         if args.action == "job":
             return service.get(args.id, include_result=True)
+        if args.action == "resume-collect":
+            job = service.resume_collection(args.capture_id, args.from_stage, args.images)
+            await service.tasks[job["job_id"]]
+            return service.get(job["job_id"], include_result=True)
         if args.action == "plan-search":
             request = JobRequest(
                 operation="plan_search",
@@ -99,7 +123,8 @@ async def run(args, db):
                 url=args.url,
                 brief_id=args.brief,
                 comment_limit=args.comments,
-                max_images=args.images,
+                max_images=max(1, args.images),
+                capture_images=args.images != 0,
             )
         job = service.submit(request)
         await service.tasks[job["job_id"]]
@@ -133,13 +158,23 @@ def main(argv=None):
     planned = sub.add_parser("search-plan")
     planned.add_argument("--source", required=True)
     planned.add_argument("--plan-job", required=True)
+    resume_collect = sub.add_parser("resume-collect")
+    resume_collect.add_argument("--capture-id", required=True)
+    resume_collect.add_argument("--from-stage", choices=["comments", "images"], required=True)
+    resume_collect.add_argument("--images", type=int, choices=range(1, 21), default=20)
     collect = sub.add_parser("collect")
     collect.add_argument("--source", required=True)
     collect.add_argument("--url", required=True)
     collect.add_argument("--brief", required=True)
     collect.add_argument("--keyword", required=True)
-    collect.add_argument("--comments", type=int, default=20)
-    collect.add_argument("--images", type=int, default=20)
+    collect.add_argument("--comments", type=int, default=5)
+    collect.add_argument("--images", type=int, choices=range(0, 21), default=20)
+    authorize = sub.add_parser(
+        "authorize-caller", help="Record explicit user consent for one capture"
+    )
+    authorize.add_argument("--capture-id", required=True)
+    authorize.add_argument("--processor", required=True)
+    authorize.add_argument("--statement-file", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
         if args.action in {"pause", "resume"}:

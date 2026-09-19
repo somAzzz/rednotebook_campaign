@@ -133,7 +133,13 @@ async def analyse_media(db, source_id, path, kind, config, *, frame_limit=4, tra
             ) as exc:
                 result["state"] = "partial" if result["frames"] else "failed"
                 result["errors"].append(
-                    exc.code if isinstance(exc, DomainError) else "vision_request_failed"
+                    exc.code
+                    if isinstance(exc, DomainError)
+                    else "vision_connection_failed"
+                    if isinstance(exc, httpx.ConnectError)
+                    else "vision_request_timeout"
+                    if isinstance(exc, (TimeoutError, httpx.TimeoutException))
+                    else "vision_request_failed"
                 )
                 break
     result["media_text"] = "\n".join(

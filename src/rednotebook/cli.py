@@ -79,7 +79,15 @@ def parser():
     schema = sub.add_parser("schema", help="输出输入契约的 JSON Schema")
     schema.add_argument(
         "kind",
-        choices=["brief", "grant", "evidence", "content-brief", "campaign-output", "search-intent"],
+        choices=[
+            "brief",
+            "grant",
+            "evidence",
+            "content-brief",
+            "campaign-output",
+            "search-intent",
+            "topic-selection",
+        ],
     )
     brief = (
         sub.add_parser("brief").add_subparsers(dest="action", required=True).add_parser("validate")
@@ -260,6 +268,7 @@ def dispatch(args):
     if args.command == "schema":
         from rednotebook.campaign_contracts import CampaignOutput, ContentBrief
         from rednotebook.search_intent import SearchIntent
+        from rednotebook.topic_research import TopicSelection
 
         return {
             "brief": ResearchBrief,
@@ -268,6 +277,7 @@ def dispatch(args):
             "content-brief": ContentBrief,
             "campaign-output": CampaignOutput,
             "search-intent": SearchIntent,
+            "topic-selection": TopicSelection,
         }[args.kind].model_json_schema(), 0
     if args.command == "brief":
         brief = load_brief(args.file)

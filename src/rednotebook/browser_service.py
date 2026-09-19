@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from pydantic import Field, ValidationError
 
-from rednotebook.adapters.browser import BrowserReader, save_capture
+from rednotebook.adapters.browser import BrowserReader, note_url, save_capture
 from rednotebook.browser_control import AccessGate
 from rednotebook.domain.models import Contract, Identifier, ResearchBrief
 from rednotebook.enrichment import enrich
@@ -26,6 +26,7 @@ from rednotebook.search_intent import (
     make_plan,
     merge_candidates,
 )
+from rednotebook.topic_research import TopicSelection, execute_topic, resolve_search
 from rednotebook.util import atomic_json, canonical, digest, stamp
 
 PAUSED = {
@@ -40,21 +41,33 @@ PAUSED = {
 
 class JobRequest(Contract):
     operation: Literal[
-        "search", "collect", "analyse_gallery", "research", "workflow", "plan_search", "search_plan"
+        "search",
+        "collect",
+        "analyse_gallery",
+        "research",
+        "workflow",
+        "plan_search",
+        "search_plan",
+        "topic_research",
     ]
     source_id: Identifier
+    topic_selection: TopicSelection | None = None
+    resume_topic_job_id: str | None = None
+    replacement_jobs: dict[str, str] = Field(default_factory=dict)
     intent: SearchIntent | None = None
     search_plan: SearchPlan | None = None
     plan_job_id: str | None = None
+    analysis_mode: Literal["local_model_analysis", "caller_analysis"] = "local_model_analysis"
     use_model: bool = False
     keyword: str = Field(default="", max_length=100)
     limit: int = Field(default=10, ge=1, le=20, strict=True)
     scrolls: int = Field(default=3, ge=0, le=5, strict=True)
     url: str = Field(default="", max_length=4000)
     brief_id: Identifier = "public-research"
-    comment_limit: int = Field(default=20, ge=0, le=100, strict=True)
+    comment_limit: int = Field(default=5, ge=0, le=100, strict=True)
     max_images: int = Field(default=20, ge=1, le=20, strict=True)
     capture_id: str = ""
+    resume_from: Literal["comments", "images"] | None = None
     brief: ResearchBrief | None = None
     budget: ResearchBudget = Field(default_factory=ResearchBudget)
     model_timeout_seconds: int = Field(default=7200, ge=60, le=28800, strict=True)
@@ -64,7 +77,7 @@ class JobRequest(Contract):
 
     @property
     def browser_work(self):
-        return self.operation in {"search", "collect", "search_plan"} or (
+        return self.operation in {"search", "collect", "search_plan", "topic_research"} or (
             self.operation == "workflow" and not self.capture_id
         )
 
@@ -128,7 +141,9 @@ class BrowserService:
             self.db.require_source(source_id, "automated_access")
         return source
 
-    def submit(self, request: JobRequest, *, reset_failure_pause=True):
+    def submit(
+        self, request: JobRequest, *, reset_failure_pause=True, parent_job_id=None, job_id=None
+    ):
         self.tasks = {key: task for key, task in self.tasks.items() if not task.done()}
         self.require(request.source_id)
         if request.browser_work:
@@ -154,7 +169,8 @@ class BrowserService:
         if request.browser_work and self.gate.status().get("remaining_hourly_navigations") == 0:
             raise DomainError("browser_hourly_budget_wait")
         if request.browser_work and any(
-            not task.done() and self.is_browser_job(key) for key, task in self.tasks.items()
+            key != parent_job_id and not task.done() and self.is_browser_job(key)
+            for key, task in self.tasks.items()
         ):
             raise DomainError("browser_job_already_active")
         if sum(not t.done() for t in self.tasks.values()) >= 4:
@@ -176,12 +192,40 @@ class BrowserService:
                 raise DomainError("workflow_brief_mismatch")
             if request.brief.synthetic != self.require(request.source_id).synthetic:
                 raise DomainError("synthetic_flag_mismatch")
+        if request.operation == "topic_research":
+            if request.topic_selection is None or request.brief is None:
+                raise DomainError("topic_selection_and_brief_required")
+            search, _ = resolve_search(self, request.source_id, request.topic_selection)
+            request = request.model_copy(
+                update={"keyword": search["plan"]["intent"]["primary_query"]}
+            )
+            if request.brief.synthetic != self.require(request.source_id).synthetic:
+                raise DomainError("synthetic_flag_mismatch")
+            if request.resume_topic_job_id:
+                previous = self.get(request.resume_topic_job_id, True)
+                if (
+                    previous["source_id"] != request.source_id
+                    or previous["operation"] != "topic_research"
+                    or previous["state"] in {"queued", "running", "complete"}
+                ):
+                    raise DomainError("topic_resume_invalid")
+                original = self.db.conn.execute(
+                    "SELECT request_json FROM browser_jobs WHERE id=?",
+                    (request.resume_topic_job_id,),
+                ).fetchone()[0]
+                original = JobRequest.model_validate_json(original)
+                if (
+                    original.topic_selection != request.topic_selection
+                    or original.brief != request.brief
+                    or original.analysis_mode != request.analysis_mode
+                ):
+                    raise DomainError("topic_resume_scope_changed")
         reset_reason = None
         if reset_failure_pause and request.operation in {"search", "search_plan"}:
             reset_reason = self.gate.reset_for_new_search()
         if request.browser_work:
             self.gate.require_active()
-        ident = str(uuid4())
+        ident = job_id or str(uuid4())
         at = stamp(self.db.clock())
         with self.db.conn:
             self.db.conn.execute(
@@ -233,7 +277,7 @@ class BrowserService:
     async def execution_lock(self, request):
         # A workflow takes each lock only for its stage. SQLite operations stay on
         # this event-loop thread and never span an await inside a transaction.
-        if request.operation == "workflow":
+        if request.operation in {"workflow", "topic_research"}:
             yield
         else:
             async with self.lock if request.browser_work else self.model_lock:
@@ -250,6 +294,12 @@ class BrowserService:
             "SELECT progress_json FROM browser_jobs WHERE id=?", (ident,)
         ).fetchone()
         previous = json.loads(row[0]) if row and row[0] else {}
+        events = previous.get("events", [])
+        events.append({"stage": stage, "at": stamp(self.db.clock())})
+        if stage == "execution_failed":
+            previous["failed_stage"] = previous.get("stage", "unknown")
+        previous["events"] = events[-100:]
+        previous["events_truncated"] = previous.get("events_truncated", False) or len(events) > 100
         with self.db.conn:
             self.db.conn.execute(
                 "UPDATE browser_jobs SET progress_json=?,updated_at=? WHERE id=? AND state!='revoked'",
@@ -281,7 +331,9 @@ class BrowserService:
                 self.update(ident, "running")
                 self.progress(ident, request.operation)
                 async with asyncio.timeout(
-                    request.model_timeout_seconds
+                    request.model_timeout_seconds * len(request.topic_selection.notes)
+                    if request.operation == "topic_research"
+                    else request.model_timeout_seconds
                     if request.operation
                     in {"analyse_gallery", "research", "workflow", "plan_search"}
                     else (
@@ -303,10 +355,12 @@ class BrowserService:
         except asyncio.CancelledError:
             self.update(ident, "cancelled", code="cancelled_by_client")
         except TimeoutError:
-            if self.is_browser_job(ident):
+            self.progress(ident, "execution_failed", error_code="job_timeout")
+            if request.operation != "topic_research" and self.is_browser_job(ident):
                 self.gate.pause("browser_job_timeout")
             self.update(ident, "failed", code="job_timeout")
         except DomainError as exc:
+            self.progress(ident, "execution_failed", error_code=exc.code)
             if (
                 self.is_browser_job(ident)
                 and exc.code in PAUSED
@@ -314,15 +368,64 @@ class BrowserService:
             ):
                 self.gate.pause(exc.code)
             self.update(ident, "paused" if exc.code in PAUSED else "failed", code=exc.code)
-        except ValidationError:
-            if self.is_browser_job(ident):
+        except ValidationError as exc:
+            self.record_failure(ident, exc)
+            if request.operation != "topic_research" and self.is_browser_job(ident):
                 self.gate.pause("browser_contract_invalid")
             self.update(ident, "failed", code="job_contract_invalid")
-        except Exception:
-            if self.is_browser_job(ident):
+        except Exception as exc:
+            self.record_failure(ident, exc)
+            if request.operation != "topic_research" and self.is_browser_job(ident):
                 self.gate.pause("browser_operation_failed")
             # Browser exception strings can contain signed URLs, page text and credentials.
             self.update(ident, "failed", code="browser_or_model_operation_failed")
+
+    def record_failure(self, ident, exc):
+        # No exception messages, locals, source lines or arbitrary class names.
+        known = {
+            "TypeError",
+            "ValidationError",
+            "ValueError",
+            "KeyError",
+            "AttributeError",
+            "RuntimeError",
+            "TimeoutError",
+            "Error",
+            "OSError",
+        }
+        kind = type(exc).__name__ if type(exc).__name__ in known else "OtherError"
+        frames = []
+        tb = exc.__traceback__
+        root = Path(__file__).resolve().parent
+        while tb:
+            path = Path(tb.tb_frame.f_code.co_filename).resolve()
+            if path.is_relative_to(root):
+                frames.append({"module": str(path.relative_to(root)), "line": tb.tb_lineno})
+            tb = tb.tb_next
+        self.progress(
+            ident, "execution_failed", failure={"exception_type": kind, "locations": frames[-5:]}
+        )
+
+    def resume_collection(self, capture_id, resume_from, max_images=20):
+        parent = self.get(capture_id)
+        if parent["operation"] not in {"collect", "workflow"} or parent["state"] in {
+            "running",
+            "queued",
+        }:
+            raise DomainError("capture_not_ready")
+        row = self.db.conn.execute(
+            "SELECT request_json FROM browser_jobs WHERE id=?", (capture_id,)
+        ).fetchone()
+        request = JobRequest.model_validate_json(row[0])
+        checkpoint_file = capture_path(self.db, capture_id) / "checkpoint.json"
+        if checkpoint_file.is_symlink() or not checkpoint_file.is_file():
+            raise DomainError("capture_checkpoint_unavailable")
+        updates = {"operation": "collect", "capture_id": capture_id, "resume_from": resume_from}
+        if resume_from == "images":
+            updates.update(capture_images=True, max_images=max_images)
+        return self.submit(
+            JobRequest.model_validate(request.model_dump() | updates), reset_failure_pause=False
+        )
 
     async def execute(self, ident, request):
         def check():
@@ -393,14 +496,34 @@ class BrowserService:
                     {**result, "query": query.model_dump(), "observed_at": stamp(self.db.clock())}
                 )
                 self.update(ident, "running", snapshot())
-            return snapshot() | {"execution_complete": True}
+                self.progress(
+                    ident,
+                    "search_plan",
+                    query_id=query.id,
+                    completed_queries=len(results),
+                    planned_queries=len(plan.queries),
+                )
+            return snapshot() | {
+                "execution_complete": True,
+                "achieved_depth": "search_only",
+                "research_complete": False,
+                "next_action": "select_notes_then_research_topic",
+            }
+        if request.operation == "topic_research":
+            return await execute_topic(self, ident, request)
         if request.operation == "workflow":
             return await self.workflow(ident, request)
         if request.operation == "search":
             result = await self.reader.search(
                 request.keyword, request.limit, request.scrolls, check
             )
-            return result | {"observed_at": stamp(self.db.clock()), "source_id": source.id}
+            return result | {
+                "observed_at": stamp(self.db.clock()),
+                "source_id": source.id,
+                "achieved_depth": "search_only",
+                "research_complete": False,
+                "candidate_count": len(result.get("candidates", [])),
+            }
         if request.operation == "collect":
             target = capture_path(self.db, ident)
             target.mkdir(parents=True, mode=0o700)
@@ -430,6 +553,44 @@ class BrowserService:
                 )
                 return result
 
+            self.progress(
+                ident,
+                "collect_start",
+                access={
+                    k: self.gate.status().get(k)
+                    for k in (
+                        "paused",
+                        "remaining_hourly_navigations",
+                        "next_navigation_in_seconds",
+                    )
+                },
+            )
+            resume_options = {}
+            if request.resume_from:
+                parent = self.get(request.capture_id)
+                if parent["source_id"] != request.source_id or parent["state"] in {
+                    "running",
+                    "queued",
+                }:
+                    raise DomainError("capture_source_or_type_mismatch")
+                previous = capture_path(self.db, request.capture_id)
+                if (previous / "checkpoint.json").is_symlink():
+                    raise DomainError("capture_checkpoint_unavailable")
+                resume = json.loads((previous / "checkpoint.json").read_text())
+                if resume["raw"].get("identity", {}).get("note_id") != note_url(request.url)[0]:
+                    raise DomainError("capture_identity_unverified")
+                import hashlib
+
+                for item in resume["images"]:
+                    name = f"{item['position']:02d}.image"
+                    if item["path"] != name or (previous / name).is_symlink():
+                        raise DomainError("capture_image_invalid")
+                    data = (previous / name).read_bytes()
+                    if hashlib.sha256(data).hexdigest() != item["sha256"]:
+                        raise DomainError("capture_image_invalid")
+                    (target / name).write_bytes(data)
+                    (target / name).chmod(0o600)
+                resume_options = {"resume": resume, "resume_from": request.resume_from}
             collected = await self.reader.collect(
                 request.url,
                 target,
@@ -438,6 +599,7 @@ class BrowserService:
                 check,
                 on_progress=saved,
                 capture_images=request.capture_images,
+                **resume_options,
             )
             if collected["state"] == "skipped":
                 return collected
@@ -472,6 +634,13 @@ class BrowserService:
             # Enriched evidence is imported explicitly via import_capture after analysis.
             evidence = json.loads((target / "evidence.json").read_text())
             atomic_json(target / "enriched.json", enrich(evidence, result))
+            from rednotebook.research.gallery import PROVIDER_FAILURES
+
+            fatal = next(
+                (e["code"] for e in result["errors"] if e["code"] in PROVIDER_FAILURES), None
+            )
+            if fatal:
+                raise DomainError(fatal)
             return {
                 k: result[k]
                 for k in ("state", "processed", "declared_total", "missing_positions", "requests")
@@ -511,6 +680,8 @@ class BrowserService:
         }
         if include_result:
             result["result"] = json.loads(row["result_json"]) if row["result_json"] else None
+            if result["result"] and "next_action" in result["result"]:
+                result["result"]["next_action"] = result["recovery"]["next_action"]
         return result
 
     async def cancel(self, ident):
@@ -532,6 +703,8 @@ class BrowserService:
         ).fetchone()[0]
         # New job ID preserves original attempt; gallery retry reuses successful image cache.
         parsed = JobRequest.model_validate_json(request)
+        if parsed.operation == "topic_research":
+            raise DomainError("use_resume_topic_research")
         saved = self.get(ident, True).get("result") or {}
         if parsed.operation == "workflow" and saved.get("capture_id"):
             parsed = parsed.model_copy(update={"capture_id": saved["capture_id"], "url": ""})
@@ -566,21 +739,63 @@ class BrowserService:
 
     def recovery(self, row):
         saved = json.loads(row["result_json"]) if row["result_json"] else {}
-        capture_id = saved.get("capture_id")
+        request = json.loads(row["request_json"])
+        capture_id = saved.get("capture_id") or request.get("capture_id") or None
         available = bool(
             capture_id and (capture_path(self.db, capture_id) / "evidence.json").is_file()
         )
+        access = self.gate.status()
+        if access["paused"]:
+            action = (
+                "fresh_search_or_explicit_operator_cli"
+                if access.get("new_search_reset_available")
+                else "resolve_pause_then_explicit_operator_resume"
+            )
+        elif row["error_code"] in {
+            "vision_connection_failed",
+            "vision_request_timeout",
+            "vision_provider_rejected",
+        }:
+            action = "restore_local_model_then_resume_workflow"
+        elif row["error_code"] in {
+            "capture_image_snapshot_unverified",
+            "capture_snapshot_changed",
+            "note_content_mismatch",
+            "note_identity_mismatch",
+        }:
+            action = "review_capture_then_explicit_recollect"
+        elif row["state"] in {"queued", "running"}:
+            action = "wait_or_read_result"
+        elif saved.get("next_action"):
+            action = saved["next_action"]
+            # Interpret older saved responses without modifying historical payloads.
+            if "allow_partial" in action:
+                action = (
+                    "retry_gallery_then_continue_workflow"
+                    if saved.get("gallery")
+                    else self.capture_recovery_action(saved.get("capture", saved))
+                )
+        elif available:
+            action = self.capture_recovery_action(saved.get("capture", saved))
+        elif row["state"] in {"failed", "interrupted", "cancelled"}:
+            action = "inspect_error_then_explicit_recovery"
+        else:
+            action = "wait_or_read_result"
         return {
             "capture_id": capture_id,
             "saved_capture_available": available,
-            "next_action": "import_saved_capture_with_allow_partial_or_continue_workflow"
-            if available
-            and row["state"] in {"failed", "paused", "interrupted", "cancelled", "partial"}
-            else "resolve_pause_then_explicit_operator_resume"
-            if self.gate.status()["paused"]
-            else "wait_or_read_result",
+            "next_action": action,
             "automatic_browser_retry": False,
         }
+
+    @staticmethod
+    def capture_recovery_action(capture):
+        review = capture.get("completeness", {})
+        if review.get("capture_gate") == "passed":
+            return "continue_workflow_with_capture_id"
+        if review.get("missing_positions") or review.get("images") in {"partial", "unknown"}:
+            return "resume_collect_images"
+        return "review_capture_then_explicit_recollect"
 
     async def workflow(self, ident, request):
         capture_id = request.capture_id or ident
@@ -594,12 +809,11 @@ class BrowserService:
                     )
             if capture.get("state") == "skipped":
                 return capture
-            if capture.get("errors"):
-                self.gate.pause("capture_incomplete_requires_review")
-            if capture["state"] != "complete":
-                return capture | {
-                    "next_action": "continue_workflow_with_capture_id_and_allow_partial"
-                }
+            if (
+                capture["state"] != "complete"
+                or capture.get("completeness", {}).get("capture_gate") != "passed"
+            ):
+                return capture | {"next_action": self.capture_recovery_action(capture)}
         else:
             parent = self.get(capture_id, True)
             if parent["source_id"] != request.source_id or parent["operation"] not in {
@@ -609,9 +823,22 @@ class BrowserService:
                 raise DomainError("capture_source_or_type_mismatch")
             if parent["state"] in {"queued", "running"}:
                 raise DomainError("capture_not_ready")
-            capture = parent["result"] or {}
-            if parent["state"] != "complete" and not request.allow_partial:
+            saved_result = parent["result"] or {}
+            capture = saved_result.get("capture", saved_result)
+            checkpoint_file = capture_path(self.db, capture_id) / "checkpoint.json"
+            if checkpoint_file.is_file() and not checkpoint_file.is_symlink():
+                saved_capture = json.loads(checkpoint_file.read_text())
+                capture = {
+                    **saved_capture,
+                    "images": len(saved_capture.get("images", [])),
+                }
+            if capture.get("state") != "complete" and not request.allow_partial:
                 raise DomainError("partial_capture_requires_explicit_import")
+            if (
+                capture.get("completeness", {}).get("capture_gate") != "passed"
+                and not request.allow_partial
+            ):
+                raise DomainError("capture_completeness_requires_review")
         target = capture_path(self.db, capture_id)
         evidence_path = target / "evidence.json"
         if not evidence_path.is_file() or evidence_path.is_symlink():
@@ -623,6 +850,17 @@ class BrowserService:
             for r in evidence
         ):
             raise DomainError("workflow_brief_mismatch")
+        if request.analysis_mode == "caller_analysis":
+            return {
+                "state": "complete",
+                "capture_id": capture_id,
+                "analysis_mode": "caller_analysis",
+                "research_complete": False,
+                "campaign_ready": False,
+                "completeness": capture["completeness"],
+                "brief": request.brief.model_dump(mode="json"),
+                "next_action": "read_evidence_bundle",
+            }
         self.update(ident, "running", {"capture_id": capture_id, "capture": capture})
         self.progress(ident, "waiting_for_model", capture_id=capture_id)
         async with self.model_lock:
@@ -640,7 +878,7 @@ class BrowserService:
                         "state": "partial",
                         "capture_id": capture_id,
                         "gallery": gallery,
-                        "next_action": "continue_workflow_with_allow_partial_or_retry_gallery",
+                        "next_action": "retry_gallery_then_continue_workflow",
                     }
                 enriched = True
             self.progress(ident, "import", capture_id=capture_id)
@@ -660,6 +898,26 @@ class BrowserService:
             if capture.get("state") == "partial" or (gallery and gallery["state"] != "complete")
             else result["state"],
             "capture_id": capture_id,
+            "completeness": capture.get("completeness", {})
+            | {
+                "image_reading": "not_applicable"
+                if capture.get("declared_total") == 0
+                else "complete"
+                if gallery and gallery["state"] == "complete"
+                else "not_run",
+                "human_accuracy_review": "not_run",
+            },
+            "reading_scope": {
+                "capture_state": capture.get("state", "unknown"),
+                "records": capture.get("records"),
+                "saved_images": capture.get("images"),
+                "declared_images": capture.get("declared_total"),
+                "capture_images_requested": request.capture_images,
+                "analyse_images_requested": request.analyse_images,
+                "comment_limit": request.comment_limit,
+                "max_images": request.max_images,
+                "limitations": capture.get("errors", []),
+            },
             "gallery": gallery,
             "import": imported,
             "research": result,

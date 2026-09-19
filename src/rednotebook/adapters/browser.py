@@ -12,10 +12,12 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
 from rednotebook.browser_control import AccessGate
+from rednotebook.browser_deadline import browser_deadline
 from rednotebook.browser_session import BrowserSession
+from rednotebook.capture_review import completeness, select_comments
 from rednotebook.domain.models import EvidenceInput
 from rednotebook.errors import DomainError
-from rednotebook.util import atomic_json, stamp
+from rednotebook.util import atomic_json, digest, stamp
 
 ORIGIN = "https://www.xiaohongshu.com"
 NOTE_PATH = re.compile(r"/(?:explore|search_result)/([0-9a-f]{24})$")
@@ -25,7 +27,9 @@ SEARCH_DOM = """() => Array.from(document.querySelectorAll('section.note-item'))
  .filter(a=>{const r=a.getBoundingClientRect();return r.width>0&&r.height>0;});
  const link=links.find(a=>new URL(a.href).searchParams.has('xsec_token')) || links[0];
  return {url:link?.href || '',title:e.querySelector('.title')?.innerText || '',
- metric_display:e.querySelector('.like-wrapper')?.innerText || ''};
+ metric_display:e.querySelector('.like-wrapper')?.innerText || '',
+ video:!!e.querySelector('video, .play-icon, .video-icon') ||
+ Array.from(e.querySelectorAll('svg use')).some(u => /video|play/i.test(u.getAttribute('href') || u.getAttribute('xlink:href') || ''))};
 })"""
 DETAIL_DOM = """() => {
  const n=document.querySelector('#noteContainer'); if(!n) return null;
@@ -39,15 +43,45 @@ DETAIL_DOM = """() => {
  comments:Array.from(n.querySelectorAll('.comment-item')).slice(0,200).map(e=>({
  id:e.id || '',text:e.querySelector('.content')?.innerText?.trim() || '',
  author:e.querySelector('[data-user-id]')?.getAttribute('data-user-id') || null,
+ likes:e.querySelector('.like-wrapper .count')?.innerText?.trim() || '',
+ replies:e.querySelector('.reply-count')?.innerText?.trim() || '',
+ pinned:!!e.querySelector('.top-tag, .pinned-tag'),
+ parent_id:e.closest('.reply-container')?.closest('.comment-item')?.id || null,
  reply:e.classList.contains('comment-item-sub') || !!e.closest('.reply-container')
  }))};
 }"""
+IDENTITY_DOM = """() => {
+ const n=document.querySelector('#noteContainer');
+ const urls=[...document.querySelectorAll('link[rel="canonical"],meta[property="og:url"]')].map(e=>e.href||e.content);
+ const ids=[n?.getAttribute('data-note-id'),n?.getAttribute('data-id')].filter(Boolean);
+ const state=window.__INITIAL_STATE__?.note;
+ const current=typeof state?.currentNoteId==='string' ? state.currentNoteId : state?.currentNoteId?.value ?? state?.currentNoteId?._value;
+ if(typeof current==='string') ids.push(current);
+ const note=state?.noteDetailMap?.[current]?.note;
+ if(typeof note?.noteId==='string') ids.push(note.noteId);
+ if(typeof note?.id==='string') ids.push(note.id);
+ return {url:location.href, ids, urls};
+}"""
+BODY_CHECK_DOM = r"""() => {
+ const n=document.querySelector('#noteContainer');
+ const d=n?.querySelector('#detail-desc');
+ const folded=!!n?.querySelector('#detail-desc .expand, #detail-desc .show-more, #detail-desc [aria-expanded="false"]');
+ const clipped=d && (d.scrollHeight>d.clientHeight+2) && ['hidden','clip'].includes(getComputedStyle(d).overflowY);
+ const state=window.__INITIAL_STATE__?.note;
+ const current=typeof state?.currentNoteId==='string' ? state.currentNoteId : state?.currentNoteId?.value ?? state?.currentNoteId?._value;
+ const desc=state?.noteDetailMap?.[current]?.note?.desc;
+ const text=d?.innerText?.trim()||'';
+ // Metadata encodes visible #topics as #topic[话题]#. Keep saved DOM text intact.
+ const renderedDesc=typeof desc==='string' ? desc.replace(/#([^#\n]+)\[话题\]#/g,'#$1').trim() : desc;
+ return {present:!!d || desc==='', folded:folded||!!clipped, text, metadata_matches:typeof renderedDesc!=='string' || renderedDesc===text};
+}"""
+
 CURRENT_IMAGE = """() => {
  const root=document.querySelector('#noteContainer'); if(!root) return null;
  const platform=location.hostname==='www.xiaohongshu.com';
  const allowed=src=>{try{const u=new URL(src);return u.protocol==='https:'&&u.hostname.endsWith('.xhscdn.com');}catch{return false;}};
  const candidates=Array.from(root.querySelectorAll('.note-slider-img img')).map(e=>{
- const r=e.getBoundingClientRect(); const p=e.parentElement.getBoundingClientRect();
+ const r=e.getBoundingClientRect(); const p=(e.closest('.note-slider')||e.parentElement).getBoundingClientRect();
  const visible=Math.max(0,Math.min(r.right,innerWidth,p.right)-Math.max(r.left,0,p.left));
  const src=platform ? [e.currentSrc,e.src,e.getAttribute('src')].find(allowed) : e.currentSrc;
  return {src:src||'',visible,loaded:e.complete&&e.naturalWidth>0};
@@ -57,6 +91,48 @@ CURRENT_IMAGE = """() => {
  }).sort((a,b)=>b.visible-a.visible);
  return candidates[0]?.src || null;
 }"""
+
+
+# Runs before site scripts and on existing tabs. Keep the video element so detail
+# classification still works; block playback even when bytes are cached or blob-backed.
+VIDEO_GUARD = """(() => {
+ if (window.__rednotebookVideoGuard) return;
+ window.__rednotebookVideoGuard = true;
+ const stop = v => {v.pause(); v.muted=true; v.autoplay=false;
+   v.removeAttribute('autoplay'); v.preload='none';};
+ const originalPlay = HTMLMediaElement.prototype.play;
+ HTMLMediaElement.prototype.play = function(...args) {
+   if (this instanceof HTMLVideoElement) {stop(this); return Promise.resolve();}
+   return originalPlay.apply(this,args);
+ };
+ const sweep = root => {
+   if (root instanceof HTMLVideoElement) stop(root);
+   if (root.querySelectorAll) root.querySelectorAll('video').forEach(stop);
+ };
+ document.addEventListener('play', e => {
+   if (e.target instanceof HTMLVideoElement) stop(e.target);
+ }, true);
+ new MutationObserver(records => {
+   for (const r of records) {
+     if (r.type==='attributes' && r.target instanceof HTMLVideoElement) stop(r.target);
+     for (const n of r.addedNodes) sweep(n);
+   }
+ }).observe(document, {subtree:true, childList:true, attributes:true, attributeFilter:['autoplay']});
+ sweep(document);
+})();"""
+
+
+def is_video_request(request):
+    url = urlsplit(request.url)
+    host = (url.hostname or "").lower()
+    return request.resource_type == "media" or (
+        request.resource_type in {"fetch", "xhr", "other"}
+        and (
+            bool(re.search(r"\.(mp4|m3u8|m4s|webm|flv|ts)$", url.path, re.I))
+            or host.endswith(".xhscdn.com")
+            and "video" in host
+        )
+    )
 
 
 def note_url(value):
@@ -92,7 +168,7 @@ def metric(name, raw, at):
 def records_from_dom(raw, source, brief_id, keyword, run_id, url, at, comment_limit):
     note_id, _ = note_url(url)
     text = raw.get("text", "").strip() or raw.get("title", "").strip()
-    if not text:
+    if not text and not raw.get("has_images"):
         raise DomainError("browser_note_text_missing")
     comments = [c for c in raw.get("comments", []) if c.get("id") and c.get("text")]
     comments = list({c["id"]: c for c in comments}.values())[:comment_limit]
@@ -121,6 +197,11 @@ def records_from_dom(raw, source, brief_id, keyword, run_id, url, at, comment_li
         "external_id": note_id,
         "title": raw.get("title", ""),
         "text": text,
+        "text_origin": "body"
+        if raw.get("text", "").strip()
+        else "title_fallback"
+        if text
+        else "empty_body",
         "locator": f"{ORIGIN}/explore/{note_id}",
         "author_id": author,
         "format": "image_text" if raw.get("has_images") else None,
@@ -144,6 +225,8 @@ def records_from_dom(raw, source, brief_id, keyword, run_id, url, at, comment_li
                 "text": c["text"],
                 "locator": note["locator"] + "#" + quote(c["id"], safe=""),
                 "author_id": c.get("author"),
+                "text_origin": "comment",
+                "metrics": [metric(k, c.get(k, ""), at) for k in ("likes", "replies")],
                 "is_reply": bool(c.get("reply")),
                 "is_author_reply": bool(author and c.get("author") == author),
             }
@@ -161,6 +244,14 @@ class BrowserReader:
         self.session = BrowserSession(self.profile)
 
     async def open(self, *, attach_only=False):
+        try:
+            async with browser_deadline(60, "browser_open_timeout"):
+                await self._open(attach_only=attach_only)
+        except BaseException:
+            await self.close()
+            raise
+
+    async def _open(self, *, attach_only=False):
         if not attach_only:
             self.gate.require_active()
         if self.context:
@@ -180,6 +271,8 @@ class BrowserReader:
             else:
                 self.browser = await self.session.connect(self.playwright, create=not attach_only)
                 self.context = self.browser.contexts[0]
+            self.context.set_default_timeout(10000)
+            await self.context.add_init_script(VIDEO_GUARD)
             await self.context.route("**/*", self._route)
             self.page = next(
                 (
@@ -192,31 +285,56 @@ class BrowserReader:
             if self.page is None:
                 self.page = await self.context.new_page()
             self.page.set_default_timeout(10000)
+            async with browser_deadline(5, "browser_renderer_unresponsive"):
+                await self.page.evaluate("1")
+                await self.page.evaluate(VIDEO_GUARD)
+
+            # Concurrent and bounded: tab count must not multiply attach latency.
+            async def protect(existing):
+                async with browser_deadline(5, "browser_video_guard_timeout"):
+                    await existing.evaluate(VIDEO_GUARD)
+
+            pending = [
+                asyncio.create_task(protect(p)) for p in self.context.pages if p != self.page
+            ]
+            try:
+                if pending:
+                    await asyncio.gather(*pending)
+            finally:
+                for task in pending:
+                    if not task.done():
+                        task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
         except BaseException:
-            await self.close()
             raise
 
     async def _route(self, route):
-        if route.request.resource_type == "media":
+        if is_video_request(route.request):
             await route.abort()
         else:
             await route.continue_()
 
     async def close(self):
         """Disconnect automation. Keep the visible dedicated browser and its live login session."""
+        context, browser, driver = self.context, self.browser, self.playwright
+        self.context = self.page = self.browser = self.playwright = None
         try:
-            if self.context and self.browser:
-                await self.context.unroute("**/*", self._route)
-                await self.browser.close()
-            elif self.context:
-                await self.context.close()
-        except PlaywrightError:
+            async with asyncio.timeout(5):
+                if context and browser:
+                    await context.unroute("**/*", self._route)
+                    await browser.close()
+                elif context:
+                    await context.close()
+        except (PlaywrightError, TimeoutError):
             pass
         finally:
-            self.context = self.page = self.browser = None
-            if self.playwright:
-                await self.playwright.stop()
-                self.playwright = None
+            if driver:
+                try:
+                    async with asyncio.timeout(5):
+                        await driver.stop()
+                except (PlaywrightError, TimeoutError):
+                    pass
 
     async def shutdown(self):
         """Explicit operator request to close the dedicated browser, preserving its profile."""
@@ -249,6 +367,16 @@ class BrowserReader:
             return "unknown"
 
     async def dismiss_note_overlay(self, *, paced=True):
+        # Pacing belongs outside the recovery deadline, and is skipped by recover-ui.
+        if paced:
+            async with browser_deadline(5, "browser_renderer_unresponsive"):
+                if await self.note_overlay_state() != "visible":
+                    return False
+            await self.gate.action()
+        async with browser_deadline(20, "note_overlay_recovery_timeout"):
+            return await self._dismiss_note_overlay()
+
+    async def _dismiss_note_overlay(self):
         """Operator recovery: leave one stale note route without clearing a pause."""
         if not self.page or self.page.is_closed():
             raise DomainError("browser_session_not_running")
@@ -257,8 +385,6 @@ class BrowserReader:
         mask = self.page.locator(".note-detail-mask:visible").first
         if not await mask.count() or not await mask.locator("#noteContainer:visible").count():
             return False
-        if paced:
-            await self.gate.action()
         try:
             # Closing controls/backdrop clicks can leave the direct detail route
             # mounted. Operator recovery returns to the prior route explicitly.
@@ -278,6 +404,10 @@ class BrowserReader:
         return True
 
     async def state(self):
+        async with browser_deadline(15, "browser_status_timeout"):
+            return await self._state()
+
+    async def _state(self):
         overlay = await self.note_overlay_state()
         if self.gate.status()["paused"]:
             return {
@@ -351,6 +481,7 @@ class BrowserReader:
             await self.check()
             raise DomainError("search_results_unavailable") from None
         found = {}
+        skipped_videos = set()
         for turn in range(scrolls + 1):
             checkpoint()
             await self.check()
@@ -358,6 +489,9 @@ class BrowserReader:
                 try:
                     ident, url = note_url(raw["url"])
                 except DomainError:
+                    continue
+                if raw.get("video"):
+                    skipped_videos.add(ident)
                     continue
                 found.setdefault(
                     ident,
@@ -384,6 +518,7 @@ class BrowserReader:
             "sort": "unknown",
             "truncated": True,
             "candidates": list(found.values()),
+            "skipped_video_count": len(skipped_videos),
             "scrolls": turn,
             "limitations": ["bounded_search_not_representative", "ranking_unverified"],
         }
@@ -397,137 +532,379 @@ class BrowserReader:
             return visible
         return self.page.locator(".pagination-teleport-container .pagination-item:visible")
 
+    async def image_position(self):
+        return await self.page.evaluate(r"""() => {
+          const root=document.querySelector('#noteContainer');
+          const fraction=root?.querySelector('.fraction, .swiper-pagination-fraction');
+          const match=fraction?.textContent.match(/(\d+)\s*\/\s*\d+/);
+          if(match) return Number(match[1]);
+          const containers=document.querySelectorAll(
+            '#noteContainer .pagination-media-container, .pagination-teleport-container');
+          for(const c of containers) {
+            if(!c.getClientRects().length || getComputedStyle(c).display==='none') continue;
+            const dots=Array.from(c.querySelectorAll('.pagination-item'));
+            const active=dots.findIndex(d=>d.matches(
+              '.active, .selected, .pagination-item-active, [aria-current="true"]') || d.querySelector('.dot.active'));
+            if(active>=0) return active+1;
+          }
+          return null;
+        }""")
+
+    async def prepare_interaction(self):
+        # Background Chromium can suspend rAF: Playwright actionability then waits
+        # forever for stability even when hit testing finds the correct control.
+        # Activate only our dedicated page; retain all normal actionability checks.
+        await self.check()
+        async with browser_deadline(5, "browser_interaction_timeout"):
+            await self.page.bring_to_front()
+
+    async def select_image_page(self, position):
+        # Reveal hover-only navigation before resolving controls. Never force a click
+        # or dispatch synthetic DOM events through overlays/access challenges.
+        await self.prepare_interaction()
+        slider = self.page.locator("#noteContainer .note-slider").first
+        if not await slider.count():
+            slider = self.page.locator("#noteContainer .note-slider-img").first
+        if await slider.count():
+            await slider.hover(timeout=2000)
+        dots = await self.image_pagination()
+        if await dots.count() >= position:
+            dot = dots.nth(position - 1)
+            controls = [
+                dot,
+                dot.locator(
+                    "button:visible, [role=button]:visible, img:visible, .dot:visible"
+                ).first,
+            ]
+            for control in controls:
+                if not await control.count():
+                    continue
+                try:
+                    await control.click(trial=True, timeout=1000)
+                except PlaywrightTimeoutError:
+                    continue
+                await self.gate.action()
+                await control.click(timeout=2000)
+                return
+        # A next button is only safe when an independent counter proves the
+        # starting page. This also supports resuming after a browser restart.
+        current = await self.image_position()
+        if current is None or current >= position:
+            raise DomainError("image_pagination_not_interactive")
+        for expected in range(current + 1, position + 1):
+            await self.check()
+            next_button = self.page.locator(
+                "#noteContainer .arrow-controller.right:visible, "
+                "#noteContainer .swiper-button-next:visible, "
+                '#noteContainer button[aria-label="下一张"]:visible'
+            )
+            if await next_button.count() != 1:
+                raise DomainError("image_pagination_unavailable")
+            await self.gate.action()
+            await next_button.click(timeout=2000)
+            for _ in range(20):
+                if await self.image_position() == expected:
+                    break
+                await asyncio.sleep(0.1)
+            else:
+                raise DomainError("image_page_unverified")
+
+    async def verify_note_identity(self, expected):
+        observed = await self.page.evaluate(IDENTITY_DOM)
+        ids = {v for v in observed["ids"] if re.fullmatch(r"[0-9a-f]{24}", v)}
+        for link in observed["urls"]:
+            try:
+                ids.add(note_url(link)[0])
+            except DomainError:
+                continue
+        try:
+            landed = note_url(observed["url"])[0]
+        except DomainError:
+            landed = None
+        if landed is not None and landed != expected or any(i != expected for i in ids):
+            raise DomainError("note_identity_mismatch")
+        if landed is None or expected not in ids:
+            raise DomainError("note_identity_unverified")
+        return {"state": "verified", "note_id": expected, "basis": "detail_metadata_and_route"}
+
     async def collect(
         self,
         url,
         target,
-        comment_limit=20,
+        comment_limit=5,
         max_images=20,
         checkpoint=lambda: None,
         on_progress=None,
         capture_images=True,
+        resume=None,
+        resume_from=None,
     ):
-        _, url = note_url(url)
+        expected, url = note_url(url)
         if not 0 <= comment_limit <= 100 or not 1 <= max_images <= 20:
             raise DomainError("browser_collect_budget_invalid")
         checkpoint()
-        await self.navigate(url)
+        same_page = False
+        if resume:
+            await self.open()
+            try:
+                await self.verify_note_identity(expected)
+                same_page = True
+            except DomainError:
+                pass
+        if not same_page:
+            await self.navigate(url)
         try:
             await self.page.locator("#noteContainer").wait_for(state="visible")
         except Exception:
             await self.check()
             raise DomainError("note_detail_unavailable") from None
+        identity = await self.verify_note_identity(expected)
         raw = await self.page.evaluate(DETAIL_DOM)
         if raw["video"]:
             return {"state": "skipped", "reason": "video_deferred"}
-        images, errors, total = [], [], None
+        # Only explicitly named expansion controls, never arbitrary text from the note.
+        expand = self.page.locator("#detail-desc").get_by_text(
+            re.compile(r"^(展开|展开全文|更多)$"), exact=True
+        )
+        if await expand.count() == 1 and await expand.is_visible():
+            await self.gate.action()
+            await self.prepare_interaction()
+            await expand.click(timeout=5000)
+        first = await self.page.evaluate(BODY_CHECK_DOM)
+        await asyncio.sleep(0.1)
+        second = await self.page.evaluate(BODY_CHECK_DOM)
+        raw = await self.page.evaluate(DETAIL_DOM)
+        if not second["metadata_matches"] and not second["folded"]:
+            raise DomainError("note_content_mismatch")
+        raw["identity"] = identity
+        raw["body_check"] = {
+            "state": "complete"
+            if second["present"]
+            and not second["folded"]
+            and first["text"] == second["text"]
+            and raw["text"] == second["text"]
+            and second["metadata_matches"]
+            else "unknown",
+            "basis": "expanded_dom_stability_not_human_review",
+        }
+        if resume and (
+            resume["raw"].get("text") != raw.get("text")
+            or resume["raw"].get("title") != raw.get("title")
+        ):
+            raise DomainError("capture_snapshot_changed")
+        images = list(resume.get("images", [])) if resume else []
+        errors = list(resume.get("errors", [])) if resume_from == "comments" else []
+        total = resume.get("declared_total") if resume else None
+        value = {
+            "state": "partial",
+            "raw": raw,
+            "images": images,
+            "errors": errors,
+            "image_checks": list(resume.get("image_checks", [])) if resume else [],
+            "declared_total": total,
+            "comment_status": "not_requested",
+            "image_capture": "requested" if capture_images else "not_requested",
+        }
 
         def persist(stage):
             checkpoint()
+            value["declared_total"] = total
+            value["completeness"] = completeness(value)
             if on_progress:
-                on_progress(
-                    {
-                        "state": "partial",
-                        "raw": {**raw, "comments": raw["comments"][:comment_limit]},
-                        "images": list(images),
-                        "declared_total": total,
-                        "errors": list(errors) or [{"code": "capture_in_progress"}],
-                    },
-                    stage,
-                )
+                on_progress(value, stage)
 
+        async def image_signature(expected_total):
+            resources = await self.page.evaluate("""() => {
+              const s=window.__INITIAL_STATE__?.note;
+              const current=typeof s?.currentNoteId==='string' ? s.currentNoteId : s?.currentNoteId?.value ?? s?.currentNoteId?._value;
+              const list=s?.noteDetailMap?.[current]?.note?.imageList;
+              if(Array.isArray(list)) return list.map(i=>i.urlDefault||i.url_default||i.url||'');
+              const slides=Array.from(document.querySelectorAll('#noteContainer .swiper-slide:not(.swiper-slide-duplicate)'));
+              if(slides.length) return slides.map(e=>e.querySelector('.note-slider-img img')).map(i=>i?.currentSrc||i?.src||'');
+              return Array.from(document.querySelectorAll('#noteContainer .note-slider-img img')).map(i=>i.currentSrc||i.src);
+            }""")
+            return (
+                digest(resources)
+                if expected_total is not None
+                and len(resources) == expected_total
+                and all(resources)
+                else None
+            )
+
+        if resume and images:
+            signature = await image_signature(resume.get("declared_total"))
+            if not signature or signature != resume.get("image_set_signature"):
+                raise DomainError("capture_image_snapshot_unverified")
         persist("text_saved")
-        for _ in range(3 if comment_limit else 0):
-            if len(raw["comments"]) >= comment_limit:
-                break
-            checkpoint()
-            panel = self.page.locator("#noteContainer .note-scroller").first
-            if not await panel.count():
-                break
-            await self.gate.action()
-            await panel.hover()
-            await self.page.mouse.wheel(0, 650)
-            await asyncio.sleep(0.5)
-            await self.check()
-            raw = await self.page.evaluate(DETAIL_DOM)
-            persist("comments_saved")
-        if not capture_images:
-            return {
-                "state": "complete",
-                "raw": raw,
-                "images": [],
-                "declared_total": None,
-                "errors": [],
-                "image_capture": "not_requested",
-            }
-        dots = await self.image_pagination()
-        total = await dots.count()
-        if not total:
-            # Absence of pagination is not proof of a single image.
-            return {
-                "state": "partial",
-                "raw": raw,
-                "images": [],
-                "declared_total": None,
-                "errors": [{"code": "image_count_unavailable"}],
-            }
-        persist("images")
-        async with httpx.AsyncClient(timeout=30, follow_redirects=False, trust_env=False) as client:
-            for position in range(1, min(total, max_images) + 1):
-                checkpoint()
-                await self.check()
-                # The first image is already selected. Its active pagination
-                # marker may intentionally be non-interactive.
-                if position > 1:
-                    await self.gate.action()
-                    try:
-                        await dots.nth(position - 1).click()
-                    except PlaywrightTimeoutError:
-                        errors.append(
-                            {"position": position, "code": "image_pagination_not_interactive"}
-                        )
-                        break
-                    await asyncio.sleep(0.4)
-                try:
-                    await self.page.wait_for_function(CURRENT_IMAGE, timeout=30000)
-                except PlaywrightTimeoutError:
-                    errors.append({"position": position, "code": "image_not_ready"})
-                    break
-                src = await self.page.evaluate(CURRENT_IMAGE)
-                try:
-                    data = await download_image(client, src)
-                    checkpoint()
-                    file = target / f"{position:02d}.image"
-                    file.write_bytes(data)
-                    file.chmod(0o600)
-                    images.append(
-                        {
-                            "position": position,
-                            "path": file.name,
-                            "sha256": hashlib.sha256(data).hexdigest(),
-                        }
+        # Optional comments must never prevent the core image stage from running.
+        if capture_images and resume_from != "comments":
+            dots = await self.image_pagination()
+            total = await dots.count() or None
+            if total is None:
+                # Explicit slide counters and image containers provide an independent fallback.
+                image_info = await self.page.evaluate(r"""() => {
+                  const n=document.querySelector('#noteContainer');
+                  const slider=n.querySelector('.note-slider-img');
+                  const count=n.querySelector('.fraction, .swiper-pagination-fraction')?.innerText || '';
+                  const m=count.match(/\/(\d+)/);
+                  const state=window.__INITIAL_STATE__?.note;
+                  const current=typeof state?.currentNoteId==='string' ? state.currentNoteId : state?.currentNoteId?.value ?? state?.currentNoteId?._value;
+                  const list=state?.noteDetailMap?.[current]?.note?.imageList;
+                  return {count:m?Number(m[1]):Array.isArray(list)?list.length:null,
+                    declared:n.getAttribute('data-image-count')};
+                }""")
+                total = image_info["count"]
+                if total is None and image_info["declared"] and image_info["declared"].isdigit():
+                    total = int(image_info["declared"])
+            if total is not None and (type(total) is not int or not 0 <= total <= 1000):
+                raise DomainError("image_count_invalid")
+            if total is None:
+                errors.append({"code": "image_count_unavailable"})
+            else:
+                value["image_set_signature"] = await image_signature(total)
+                persist("images_start")
+                if total:
+                    await self.prepare_interaction()
+                async with httpx.AsyncClient(
+                    timeout=30, follow_redirects=False, trust_env=False
+                ) as client:
+                    if resume and resume.get("declared_total") not in {None, total}:
+                        raise DomainError("capture_snapshot_changed")
+                    previous_src = await self.page.evaluate(CURRENT_IMAGE) if images else None
+                    for position in range(len(images) + 1, min(total, max_images) + 1):
+                        checkpoint()
+                        await self.check()
+                        await self.verify_note_identity(expected)
+                        if position > 1:
+                            try:
+                                await self.select_image_page(position)
+                            except (PlaywrightTimeoutError, DomainError) as exc:
+                                if isinstance(exc, DomainError) and exc.code not in {
+                                    "image_pagination_not_interactive",
+                                    "image_pagination_unavailable",
+                                    "image_page_unverified",
+                                }:
+                                    raise
+                                errors.append(
+                                    {
+                                        "position": position,
+                                        "code": exc.code
+                                        if isinstance(exc, DomainError)
+                                        else "image_pagination_not_interactive",
+                                    }
+                                )
+                                break
+                        try:
+                            # A changed resource proves we did not immediately save the old page.
+                            # Repeated identical resources require further manual page verification.
+                            script = (
+                                "prev => {const current=("
+                                + CURRENT_IMAGE
+                                + ")(); return current && current!==prev;}"
+                            )
+                            await self.page.wait_for_function(
+                                script, arg=previous_src, timeout=10000, polling=100
+                            )
+                            actual_position = await self.image_position()
+                            if actual_position is not None and actual_position != position:
+                                raise DomainError("image_page_unverified")
+                            src = await self.page.evaluate(CURRENT_IMAGE)
+                            data = await download_image(client, src)
+                            checkpoint()
+                            file = target / f"{position:02d}.image"
+                            file.write_bytes(data)
+                            file.chmod(0o600)
+                            from io import BytesIO
+
+                            from PIL import Image
+
+                            with Image.open(BytesIO(data)) as decoded:
+                                value.setdefault("image_checks", []).append(
+                                    {
+                                        "position": position,
+                                        "width": decoded.width,
+                                        "height": decoded.height,
+                                        "decoded": True,
+                                    }
+                                )
+                            images.append(
+                                {
+                                    "position": position,
+                                    "path": file.name,
+                                    "sha256": hashlib.sha256(data).hexdigest(),
+                                }
+                            )
+                            previous_src = src
+                            persist("images_saved")
+                        except PlaywrightTimeoutError:
+                            errors.append({"position": position, "code": "image_page_unverified"})
+                            break
+                        except (DomainError, httpx.HTTPError) as exc:
+                            errors.append(
+                                {
+                                    "position": position,
+                                    "code": exc.code
+                                    if isinstance(exc, DomainError)
+                                    else "image_network_error",
+                                }
+                            )
+                            break
+                if total > max_images and not errors:
+                    errors.append({"code": "image_limit_reached"})
+        value["image_set_signature"] = await image_signature(total)
+        persist("images_finished")
+        persist("comments_start")
+        if comment_limit:
+            observed = list(raw["comments"])
+            try:
+                async with browser_deadline(30, "comment_sample_timeout"):
+                    for _ in range(3):
+                        if len({c.get("id") for c in observed}) >= max(20, comment_limit):
+                            break
+                        panel = self.page.locator("#noteContainer .note-scroller").first
+                        if not await panel.count():
+                            break
+                        await self.gate.action()
+                        await self.prepare_interaction()
+                        await panel.hover(timeout=5000)
+                        await self.page.mouse.wheel(0, 650)
+                        await asyncio.sleep(0.5)
+                        await self.check()
+                        await self.verify_note_identity(expected)
+                        observed.extend((await self.page.evaluate(DETAIL_DOM))["comments"])
+                    raw["comments"], value["comment_sampling"] = select_comments(
+                        observed, comment_limit
                     )
-                    persist("images")
-                except (DomainError, httpx.HTTPError) as exc:
-                    errors.append(
-                        {
-                            "position": position,
-                            "code": exc.code
-                            if isinstance(exc, DomainError)
-                            else "image_network_error",
-                        }
+                    value["comment_status"] = (
+                        "sampled" if raw["comments"] else "unavailable_or_empty"
                     )
-                    break
-        if total > max_images and not errors:
-            errors.append({"code": "image_limit_reached"})
-        checkpoint()
-        return {
-            "state": "partial" if errors or len(images) != total else "complete",
-            "raw": raw,
-            "images": images,
-            "declared_total": total,
-            "errors": errors,
-        }
+            except DomainError as exc:
+                if exc.code not in {"comment_sample_timeout", "browser_interaction_timeout"}:
+                    raise
+                raw["comments"], value["comment_sampling"] = select_comments(
+                    observed, comment_limit
+                )
+                value["comment_status"] = "partial" if raw["comments"] else "unavailable"
+                value["comment_error"] = exc.code
+            except PlaywrightError:
+                raw["comments"], value["comment_sampling"] = select_comments(
+                    observed, comment_limit
+                )
+                value["comment_status"] = "partial" if raw["comments"] else "unavailable"
+                value["comment_error"] = "comment_dom_failed"
+        else:
+            raw["comments"] = []
+        await self.verify_note_identity(expected)
+        final_body = await self.page.evaluate(BODY_CHECK_DOM)
+        if final_body["text"] != raw["text"]:
+            raw["body_check"]["state"] = "unknown"
+            errors.append({"code": "body_changed_during_capture"})
+        value["completeness"] = completeness(value)
+        value["state"] = (
+            "complete" if value["completeness"]["capture_gate"] == "passed" else "partial"
+        )
+        persist("capture_finished")
+        return value
 
 
 async def download_image(client, url):
@@ -566,6 +943,11 @@ async def download_image(client, url):
 def save_capture(
     target, collected, source, brief_id, keyword, run_id, url, clock, observed_at=None
 ):
+    review = completeness(collected)
+    state = collected["state"]
+    if state == "complete" and review["capture_gate"] != "passed":
+        state = "partial"
+    atomic_json(target / "checkpoint.json", collected | {"completeness": review, "state": state})
     records = records_from_dom(
         collected["raw"], source, brief_id, keyword, run_id, url, observed_at or stamp(clock()), 100
     )
@@ -580,12 +962,16 @@ def save_capture(
         }
         atomic_json(target / "manifest.json", manifest)
     return {
+        "completeness": review,
+        "comment_sampling": collected.get("comment_sampling"),
+        "comment_error": collected.get("comment_error"),
+        "image_checks": collected.get("image_checks", []),
         "records": len(records),
         "manifest": bool(manifest),
         "images": len(collected["images"]),
         "declared_total": collected["declared_total"],
         "errors": collected["errors"],
-        "state": collected["state"],
+        "state": state,
         "missing_positions": sorted(
             set(range(1, (collected["declared_total"] or 0) + 1))
             - {i["position"] for i in collected["images"]}

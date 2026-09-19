@@ -119,3 +119,60 @@ def test_text_note_contract_and_gallery_source_boundary(fixture_data):
         enrich([raw], gallery | {"source_id": "different-source"})
     with pytest.raises(DomainError, match="gallery_requires_one_matching_note"):
         enrich([raw, raw], gallery)
+
+
+@pytest.mark.parametrize("failure", ["connection", "timeout", "provider"])
+def test_provider_failure_stops_gallery_and_progress_counts_success(db, grant, tmp_path, failure):
+    import httpx
+
+    from rednotebook.research.vision import analyse_media
+
+    db.register_grant(grant)
+    file = tmp_path / "synthetic.png"
+    Image.new("RGB", (20, 20), "blue").save(file)
+    hashed = hashlib.sha256(file.read_bytes()).hexdigest()
+    gallery = Gallery(
+        source_id=grant.id,
+        note_external_id="synthetic",
+        declared_total=17,
+        images=[{"position": p, "path": file.name, "sha256": hashed} for p in range(1, 18)],
+    )
+    calls = []
+
+    def transport(request):
+        calls.append(1)
+        if failure == "connection":
+            raise httpx.ConnectError("SECRET_SENTINEL", request=request)
+        if failure == "timeout":
+            raise httpx.ReadTimeout("SECRET_SENTINEL", request=request)
+        return httpx.Response(503, json={"error": "SECRET_SENTINEL"})
+
+    async def analyser(db, source, path, kind, config):
+        return await analyse_media(
+            db, source, path, kind, config, transport=httpx.MockTransport(transport)
+        )
+
+    progress = []
+    result = asyncio.run(
+        analyse_gallery(
+            db,
+            gallery,
+            tmp_path,
+            config(),
+            analyser=analyser,
+            progress=lambda **value: progress.append(value),
+        )
+    )
+    assert len(calls) == result["requests"] == 1
+    assert result["processed"] == progress[-1]["completed_images"] == 0
+    assert result["missing_positions"] == list(range(1, 18))
+    assert result["state"] == "partial"
+    assert (
+        result["errors"][0]["code"]
+        == {
+            "connection": "vision_connection_failed",
+            "timeout": "vision_request_timeout",
+            "provider": "vision_provider_rejected",
+        }[failure]
+    )
+    assert "SECRET_SENTINEL" not in str(result)

@@ -20,6 +20,10 @@ from rednotebook.storage.migrations import (
     MIGRATION_7,
     MIGRATION_8,
     MIGRATION_9,
+    MIGRATION_10,
+    MIGRATION_11,
+    MIGRATION_12,
+    MIGRATION_13,
 )
 from rednotebook.util import canonical, digest, now_utc, stamp
 
@@ -135,7 +139,19 @@ class Database:
         if version == 8:
             self.conn.executescript(MIGRATION_9)
             version = 9
-        if version != 9:
+        if version == 9:
+            self.conn.executescript(MIGRATION_10)
+            version = 10
+        if version == 10:
+            self.conn.executescript(MIGRATION_11)
+            version = 11
+        if version == 11:
+            self.conn.executescript(MIGRATION_12)
+            version = 12
+        if version == 12:
+            self.conn.executescript(MIGRATION_13)
+            version = 13
+        if version != 13:
             self.conn.close()
             raise DomainError("unsupported_database_version")
         self.salt = self.conn.execute(

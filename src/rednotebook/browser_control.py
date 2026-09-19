@@ -11,9 +11,9 @@ from rednotebook.util import canonical
 
 
 class AccessGate:
-    PAGE_INTERVAL = 60
+    PAGE_INTERVAL = 30
     ACTION_INTERVAL = 3
-    HOURLY_PAGE_LIMIT = 60
+    HOURLY_PAGE_LIMIT = 120
     # These pauses describe a failed local browser task, not a platform safety signal.
     # A fresh search may clear them, but retries and collection jobs may not.
     RESETTABLE_FAILURE_PAUSES = frozenset(

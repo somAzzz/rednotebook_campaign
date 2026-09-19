@@ -92,6 +92,11 @@ class ContentBrief(Contract):
         default_factory=dict
     )
     assumptions: list[str] = Field(default_factory=list, max_length=30)
+    research_mode: Literal["optional", "author_only", "search_only", "research_then_plan"] = (
+        "optional"
+    )
+    topic_job_id: str | None = None
+    search_job_id: str | None = None
     research_run_ids: list[str] = Field(default_factory=list, max_length=20)
     selected_finding_ids: list[str] = Field(default_factory=list, max_length=100)
     source_ids: list[Identifier] = Field(default_factory=list, max_length=30)

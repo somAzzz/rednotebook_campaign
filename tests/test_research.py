@@ -262,7 +262,7 @@ def test_schema_v1_upgrade_preserves_source_and_settings(tmp_path):
         connection.execute("INSERT INTO settings VALUES (?,?)", ("author_salt", "a" * 64))
     with Database(path) as upgraded:
         assert upgraded.salt == "a" * 64
-        assert upgraded.conn.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert upgraded.conn.execute("PRAGMA user_version").fetchone()[0] == 13
         assert upgraded.conn.execute("SELECT COUNT(*) FROM research_runs").fetchone()[0] == 0
 
 

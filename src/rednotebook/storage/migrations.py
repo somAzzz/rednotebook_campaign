@@ -132,3 +132,44 @@ INSERT OR IGNORE INTO settings VALUES ('search_plan_contract_version','1');
 PRAGMA user_version=9;
 COMMIT;
 """
+
+
+# Topic jobs and campaign depth references live in existing source-purgeable JSON.
+# Old payloads/hashes stay byte-identical; older binaries must reject the new contract.
+MIGRATION_10 = """
+BEGIN IMMEDIATE;
+INSERT OR IGNORE INTO settings VALUES ('topic_research_contract_version','1');
+PRAGMA user_version=10;
+COMMIT;
+"""
+
+
+# Capture checkpoints, text-origin and comment reply metrics activate a new contract.
+# Source-bound job JSON/files are purged by existing revocation; old payload bytes stay intact.
+MIGRATION_11 = """
+BEGIN IMMEDIATE;
+INSERT OR IGNORE INTO settings VALUES ('capture_review_contract_version','1');
+PRAGMA user_version=11;
+COMMIT;
+"""
+
+
+# Explicit assistant submissions use existing source-bound reports/jobs and managed
+# capture sidecars. Original grants/payloads/hashes are unchanged. Existing source
+# expiry/revocation removes the sidecars, reports and dependent campaign bundles.
+MIGRATION_12 = """
+BEGIN IMMEDIATE;
+INSERT OR IGNORE INTO settings VALUES ('assistant_review_contract_version','1');
+PRAGMA user_version=12;
+COMMIT;
+"""
+
+
+# Caller-mode jobs and generic processor provenance remain in source-bound JSON.
+# No grant, evidence or historical payload rewrite; existing expiry/revocation purge applies.
+MIGRATION_13 = """
+BEGIN IMMEDIATE;
+INSERT OR IGNORE INTO settings VALUES ('caller_analysis_contract_version','1');
+PRAGMA user_version=13;
+COMMIT;
+"""

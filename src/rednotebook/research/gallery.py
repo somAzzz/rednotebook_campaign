@@ -10,6 +10,12 @@ from rednotebook.errors import DomainError
 from rednotebook.research.vision import PROMPT, analyse_media
 from rednotebook.util import canonical, digest
 
+PROVIDER_FAILURES = {
+    "vision_connection_failed",
+    "vision_request_timeout",
+    "vision_provider_rejected",
+}
+
 
 class GalleryImage(Contract):
     position: int = Field(ge=1, le=100, strict=True)
@@ -45,7 +51,7 @@ async def analyse_gallery(
         if progress:
             progress(
                 current_position=item.position,
-                completed_images=len(results),
+                completed_images=sum(r["analysis"]["state"] == "complete" for r in results),
                 declared_total=manifest.declared_total,
             )
         file = (base / item.path).resolve()
@@ -102,10 +108,22 @@ async def analyse_gallery(
             }
         )
         if result["state"] != "complete":
-            errors.append({"position": item.position, "code": "image_analysis_incomplete"})
+            fatal = next(
+                (code for code in result.get("errors", []) if code in PROVIDER_FAILURES), None
+            )
+            errors.append({"position": item.position, "code": fatal or "image_analysis_incomplete"})
+            if fatal:
+                # A shared provider failure is not a reason to submit every remaining image.
+                break
     complete = {r["position"] for r in results if r["analysis"]["state"] == "complete"}
     missing = sorted(set(range(1, manifest.declared_total + 1)) - complete)
     db.require_source(manifest.source_id)
+    if progress:
+        progress(
+            current_position=results[-1]["position"] if results else 0,
+            completed_images=len(complete),
+            declared_total=manifest.declared_total,
+        )
     return {
         "note_external_id": manifest.note_external_id,
         "source_id": manifest.source_id,
