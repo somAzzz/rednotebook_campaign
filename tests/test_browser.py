@@ -19,6 +19,22 @@ class OfflineGate(AccessGate):
 NOTE = "https://www.xiaohongshu.com/explore/" + "a" * 24 + "?xsec_token=private"
 
 
+def offline_note_location(reader, url):
+    # Local HTML fixtures do not navigate to Xiaohongshu; provide only the route
+    # component while keeping the actual DOM identity checks intact.
+    from rednotebook.adapters.browser import IDENTITY_DOM
+
+    original = reader.page.evaluate
+
+    async def evaluate(expression, *args, **kwargs):
+        result = await original(expression, *args, **kwargs)
+        if expression == IDENTITY_DOM:
+            result["url"] = url
+        return result
+
+    reader.page.evaluate = evaluate
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -219,7 +235,7 @@ def test_real_stdio_mcp_initialization(tmp_path):
                 response = await client.call_tool("workspace_status", {})
                 diagnostic = json.loads(response.content[0].text)
                 assert diagnostic["network_access"] is False
-                assert diagnostic["schema_version"] == 9
+                assert diagnostic["schema_version"] == 13
                 response = await client.call_tool("list_history", {"kind": "notes"})
                 assert json.loads(response.content[0].text)["items"] == []
                 response = await client.call_tool(
@@ -302,6 +318,7 @@ def test_playwright_collect_orders_images_and_skips_video(tmp_path, monkeypatch)
             tmp_path / "profile", headless=True, gate=OfflineGate(tmp_path / "profile")
         )
         await reader.open()
+        offline_note_location(reader, NOTE)
         payloads = {}
         import base64
 
@@ -311,7 +328,7 @@ def test_playwright_collect_orders_images_and_skips_video(tmp_path, monkeypatch)
             encoded = "data:image/png;base64," + base64.b64encode(data.getvalue()).decode()
             payloads[encoded] = data.getvalue()
         urls = list(payloads)
-        html = '<div id="noteContainer"><div id="detail-title">标题</div><div id="detail-desc">正文</div>'
+        html = '<div id="noteContainer" data-note-id="aaaaaaaaaaaaaaaaaaaaaaaa"><div id="detail-title">标题</div><div id="detail-desc">正文</div>'
         html += '<div class="note-slider-img"><img src="' + urls[0] + '"></div></div>'
         html += '<div class="pagination-teleport-container">'
         for index, url in enumerate(urls):
@@ -357,7 +374,7 @@ def test_playwright_collect_orders_images_and_skips_video(tmp_path, monkeypatch)
             assert len(attempts) == 1
             assert failed["state"] == "partial"
             assert len(failed["errors"]) == 1
-            html = '<div id="noteContainer"><video></video></div>'
+            html = '<div id="noteContainer" data-note-id="aaaaaaaaaaaaaaaaaaaaaaaa"><video></video></div>'
             result = await reader.collect(NOTE, tmp_path)
             assert result == {"state": "skipped", "reason": "video_deferred"}
         finally:
@@ -403,11 +420,11 @@ def test_navigation_spacing_persists_across_gate_instances(tmp_path):
         await first.navigation()
         second = AccessGate(tmp_path, clock=lambda: now[0], sleep=sleep)
         await second.navigation()
-        assert waits == [60]
+        assert waits == [30]
         first.pause("user_reported_platform_restriction")
         with pytest.raises(DomainError, match="browser_access_paused"):
             await second.navigation()
-        assert waits == [60]
+        assert waits == [30]
         assert len(json.loads(first.history.read_text())) == 2
 
     asyncio.run(run())
@@ -469,6 +486,7 @@ def test_hourly_budget_waits_without_persistent_pause(tmp_path):
             now[0] += seconds
 
         gate = AccessGate(tmp_path, clock=lambda: now[0], sleep=sleep)
+        assert gate.HOURLY_PAGE_LIMIT == 120
         for _ in range(AccessGate.HOURLY_PAGE_LIMIT):
             await gate.navigation()
         status = gate.status()
@@ -643,7 +661,7 @@ def test_pagination_ignores_hidden_teleport_clone(tmp_path):
         try:
             await reader.open()
             await reader.page.set_content("""
-                <div id="noteContainer"><div class="pagination-media-container">
+                <div id="noteContainer" data-note-id="aaaaaaaaaaaaaaaaaaaaaaaa"><div class="pagination-media-container">
                 <button class="pagination-item">1</button><button class="pagination-item">2</button>
                 </div></div><div class="pagination-teleport-container" style="display:none">
                 <button class="pagination-item">hidden1</button><button class="pagination-item">hidden2</button>
@@ -673,7 +691,7 @@ def test_current_platform_image_uses_allowed_src_before_decode(tmp_path):
                     status=200,
                     content_type="text/html",
                     body=(
-                        '<div id="noteContainer"><div class="note-slider-img">'
+                        '<div id="noteContainer" data-note-id="aaaaaaaaaaaaaaaaaaaaaaaa"><div class="note-slider-img">'
                         '<img style="width:400px;height:500px" '
                         'src="https://sns-webpic-qc.xhscdn.com/synthetic"></div></div>'
                     ),
@@ -788,6 +806,59 @@ def test_overlay_preflight_ignores_initial_blank_page(tmp_path):
             await reader.open()
             assert reader.page.url == "about:blank"
             assert await reader.dismiss_note_overlay() is False
+        finally:
+            await reader.close()
+
+    asyncio.run(run())
+
+
+def test_video_request_filter_includes_fetch_but_preserves_images():
+    from types import SimpleNamespace
+
+    from rednotebook.adapters.browser import is_video_request
+
+    for kind, url, blocked in [
+        ("media", "https://example.com/opaque", True),
+        ("fetch", "https://sns-video-bd.xhscdn.com/opaque", True),
+        ("xhr", "https://example.com/clip.mp4?token=private", True),
+        ("fetch", "https://example.com/part.m4s", True),
+        ("image", "https://sns-img.xhscdn.com/image.webp", False),
+        ("xhr", "https://www.xiaohongshu.com/api/note", False),
+    ]:
+        assert is_video_request(SimpleNamespace(resource_type=kind, url=url)) is blocked
+
+
+def test_video_guard_blocks_script_play_and_search_detects_video(tmp_path):
+    from rednotebook.adapters.browser import SEARCH_DOM, BrowserReader
+
+    async def run():
+        reader = BrowserReader(tmp_path / "guard", headless=True)
+        await reader.open()
+        try:
+            await reader.page.goto("about:blank")
+            await reader.page.set_content("""
+                <section class="note-item"><a href="https://www.xiaohongshu.com/explore/aaaaaaaaaaaaaaaaaaaaaaaa">video</a><i class="play-icon"></i></section>
+                <section class="note-item"><a href="https://www.xiaohongshu.com/explore/bbbbbbbbbbbbbbbbbbbbbbbb">image</a></section>
+                <video autoplay muted></video>
+            """)
+            result = await reader.page.evaluate("""async () => {
+                const v=document.querySelector('video');
+                await v.play();
+                return {paused:v.paused, autoplay:v.autoplay, guarded:!!window.__rednotebookVideoGuard};
+            }""")
+            assert result == {"paused": True, "autoplay": False, "guarded": True}
+            cards = await reader.page.evaluate(SEARCH_DOM)
+            assert [c["video"] for c in cards] == [True, False]
+
+            async def no_navigation(*args):
+                pass
+
+            reader.navigate = no_navigation
+            reader.check = no_navigation
+            result = await reader.search("synthetic", limit=2, scrolls=0)
+            assert result["skipped_video_count"] == 1
+            assert [c["note_id"] for c in result["candidates"]] == ["b" * 24]
+
         finally:
             await reader.close()
 

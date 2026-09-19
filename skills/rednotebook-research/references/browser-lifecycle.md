@@ -1,0 +1,13 @@
+# Browser lifecycle and bounded recovery
+
+The dedicated Chromium process and login profile survive MCP/CLI disconnection. A ready visible note overlay is normal route state; ordinary requested navigation replaces it. Do not invoke recovery just because an overlay is visible.
+
+`rednotebook-browser recover-ui` is an operator CLI action, not an MCP tool. It attaches to the existing browser without launching a missing session, then goes back one route with pacing disabled. It never clears an access pause. If the browser service owns the database lock, the CLI refuses competing access; do not bypass that lock. Safety pauses require the operator to resolve the cause and explicitly resume outside MCP.
+
+Browser opening has a 60-second cooperative deadline. The selected page must respond to an actual renderer evaluation within 5 seconds, including video protection installation. Other existing pages receive video protection concurrently, each with a 5-second deadline. An unresponsive tab causes failure rather than silently leaving it without protection. Status reads have a 15-second deadline, overlay recovery has a 20-second deadline, and the complete CLI status/close/recover-ui action has a 90-second deadline. Cleanup separately bounds disconnect and driver stop at 5 seconds each. These limits assume the host and event loop are running, and do not guarantee wall-clock response during host sleep.
+
+Errors distinguish browser_open_timeout, browser_renderer_unresponsive, browser_video_guard_timeout, browser_status_timeout, note_overlay_recovery_timeout and browser_control_timeout. Preserve these codes; do not print transport exceptions containing page content or signed URLs. MCP failures go through its existing diagnostic mechanism; CLI failures return structured error codes but are not automatically rows in the MCP diagnostic table.
+
+`system_suspend_or_clock_change_suspected` means wall and monotonic elapsed time diverged by more than 10 seconds. It does not prove sleep: wall-clock adjustment can also cause divergence, and platforms whose monotonic clock includes sleep may not show a gap. No userspace watchdog executes while the machine is suspended. After wake, read the saved state and report the interruption; do not automatically repeat navigation, reset access pauses or restart the browser.
+
+For long operator-run research sessions, the user can elect to inhibit idle sleep with macOS `caffeinate -i` around the normal launch command. This does not prevent every suspend cause, such as closing the lid or explicit sleep. Do not change system sleep settings automatically.
