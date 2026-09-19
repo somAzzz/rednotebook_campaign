@@ -1,0 +1,144 @@
+{
+  "verified_at": "2026-09-18T21:44:25.898216+00:00",
+  "mode": "codex_assistant_explicit_submission",
+  "source_grant_cloud_processing": "denied",
+  "scoped_consent_capture_count": 7,
+  "local_model_requests": 0,
+  "notes": 7,
+  "images": 48,
+  "comments": 22,
+  "findings": 21,
+  "resolved_citation_occurrences": 38,
+  "citation_hash_span_checks": "passed",
+  "captures": [
+    {
+      "job_id": "619af7fc-c0db-4d64-b9a7-2550d9f86dfa",
+      "capture_id": "7ae6cea7-35ec-47ae-a76b-0437cd0611e7",
+      "run_id": "876579bb-8070-4a6e-bf29-29236c682ff8",
+      "images": 1,
+      "comments": 5,
+      "findings": 3
+    },
+    {
+      "job_id": "6ed9efae-96eb-4451-a148-659b24fdb3af",
+      "capture_id": "e32d13a9-b134-47d2-afb8-1ff8e99062b8",
+      "run_id": "8351db96-1297-4c2d-ae91-2a372efddf88",
+      "images": 10,
+      "comments": 1,
+      "findings": 3
+    },
+    {
+      "job_id": "0fac9674-0536-48bd-aa98-64b058548a1d",
+      "capture_id": "8bc0bc45-ee6a-4238-bf99-6b75352f0eff",
+      "run_id": "a3ee0085-0346-45ae-a10b-bcc21efc591c",
+      "images": 7,
+      "comments": 5,
+      "findings": 3
+    },
+    {
+      "job_id": "bebb6868-e0e1-4bbf-a417-6a6e75695105",
+      "capture_id": "481cbed3-35ec-4f3e-93a8-bd1c16497e48",
+      "run_id": "81ecca6d-ebf1-4842-8b67-88c30d9a3168",
+      "images": 4,
+      "comments": 5,
+      "findings": 3
+    },
+    {
+      "job_id": "710752dd-9801-4f10-977d-f95cc16f8bc9",
+      "capture_id": "c076e02b-57b0-4c00-9eda-1d3a5250ca5c",
+      "run_id": "ea30f245-868e-4fee-aa13-66dd2586ea2a",
+      "images": 5,
+      "comments": 1,
+      "findings": 3
+    },
+    {
+      "job_id": "f29a60e7-f682-4c34-b0ff-13cb3bfc4108",
+      "capture_id": "85adddee-aa08-4b59-b68a-7ef37c628ede",
+      "run_id": "17fea30e-63a6-4b8b-8dcb-00b3c30bdbf9",
+      "images": 4,
+      "comments": 5,
+      "findings": 3
+    },
+    {
+      "job_id": "2fa3ecd5-2e0f-440e-a4b8-89c423a75143",
+      "capture_id": "ef242693-3233-4227-849a-f4cb7b1e2979",
+      "run_id": "f1da37cb-e27c-4d49-a286-42226383ebe9",
+      "images": 17,
+      "comments": 0,
+      "findings": 3
+    }
+  ],
+  "topics": [
+    {
+      "job_id": "e6e63b87-35f8-4aaf-a570-e6f674f7d5a7",
+      "candidate_count": 31,
+      "selected_count": 3,
+      "completed_count": 3,
+      "research_complete": true,
+      "campaign_ready": true
+    },
+    {
+      "job_id": "44554365-fa9b-496b-bf02-9e79610f4dbb",
+      "candidate_count": 26,
+      "selected_count": 3,
+      "completed_count": 3,
+      "research_complete": true,
+      "campaign_ready": true
+    },
+    {
+      "job_id": "a8bcb543-ec26-433d-9f8e-df9db1619427",
+      "candidate_count": 28,
+      "selected_count": 1,
+      "completed_count": 1,
+      "research_complete": true,
+      "campaign_ready": true
+    }
+  ],
+  "campaigns": [
+    {
+      "bundle_id": "d2e36115-f156-42b8-87f0-646f673f83ef",
+      "version": 2,
+      "content_hash": "09b99f0f45cb8003d351775024bb7bb4feb4a5829cfe46db625c0032e308c94b",
+      "preview_pages": 6,
+      "structure": "passed",
+      "ready_for_approval": false
+    },
+    {
+      "bundle_id": "96900d66-0a7f-4998-bc04-9a1c9f2abefa",
+      "version": 2,
+      "content_hash": "5877f0936c3b57e7a7cb06b1fc5c6a87c22897a9280fb0e51e944be6e580cbef",
+      "preview_pages": 6,
+      "structure": "passed",
+      "ready_for_approval": false
+    },
+    {
+      "bundle_id": "531ca8cc-0dab-4492-bf1d-d32973b5342b",
+      "version": 2,
+      "content_hash": "556b691bdf1e747fa9138bd86bf9414ff5eab95f1f7a5d6f320b46607413c629",
+      "preview_pages": 6,
+      "structure": "passed",
+      "ready_for_approval": false
+    }
+  ],
+  "unapproved_export": "rejected_exact_version_approval_required",
+  "human_verification": false,
+  "verbatim_ocr": false,
+  "docs18_full_acceptance": false,
+  "verification": {
+    "pytest": "224 passed in 39.56s",
+    "ruff_check": "passed",
+    "ruff_format": "107 files formatted",
+    "locked_dependencies": "passed",
+    "scaffold_links": 72,
+    "foundation": "passed; 700 synthetic records purged",
+    "mcp_research_readback": "7/7 complete",
+    "preview_visual_review": "3 representative pages checked; all 18 decoded and hash-checked"
+  },
+  "code_sha256": {
+    "src/rednotebook/research/assistant_review.py": "538576b51bcf3504eac5cb00cd95ae727bee2fbebac1aac73c8f78b3d8d41947",
+    "src/rednotebook/mcp_server.py": "ba0d0459309bb55571bf646aed72bed4aea997f0f833316f1f21ed592f31e431",
+    "src/rednotebook/campaign.py": "30b5683ab315b895fbcf9c53ca4e4b812e26e2bed01f4e99423399ab89e96653",
+    "src/rednotebook/storage/database.py": "05e34a09373ecf154d3b9695be825235edfbfd758cccb88e2be17cb95140ce79",
+    "src/rednotebook/storage/migrations.py": "67041dbc11c60f86ae934e0415e467c0cf21a3b6d90098fd3c8df5f46a10aeef"
+  }
+}

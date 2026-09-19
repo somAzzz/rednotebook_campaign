@@ -22,9 +22,9 @@
   ],
   "automation_state": "paused_after_hidden_pagination_failure",
   "pacing": {
-    "navigation_interval_seconds": 60,
+    "navigation_interval_seconds": 30,
     "action_interval_seconds": 3,
-    "hourly_page_budget": 60,
+    "hourly_page_budget": 120,
     "platform_safe_rate_claim": false
   },
   "latest_single_note_attempt": {
